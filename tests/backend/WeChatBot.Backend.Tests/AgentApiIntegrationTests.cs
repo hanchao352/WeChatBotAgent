@@ -241,6 +241,123 @@ public sealed class AgentApiIntegrationTests
     }
 
     [Fact]
+    public async Task Stale_dry_run_heartbeat_cannot_override_a_newer_non_dry_run_rejection()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAgentClient();
+        using var admin = factory.CreateAuthenticatedClient();
+        var agentId = $"ordered-dry-run-{Guid.NewGuid():N}";
+        var instanceId = $"wx-{Guid.NewGuid():N}";
+        var olderSentAt = DateTimeOffset.UtcNow.AddSeconds(-2);
+        var newerSentAt = olderSentAt.AddSeconds(1);
+
+        Assert.True((await PostHeartbeatAsync(
+            client,
+            CreateHeartbeat(agentId, instanceId, olderSentAt, dryRun: true))).Accepted);
+        Assert.False((await PostHeartbeatAsync(
+            client,
+            CreateHeartbeat(agentId, instanceId, newerSentAt, dryRun: false))).Accepted);
+
+        var replay = await PostHeartbeatAsync(
+            client,
+            CreateHeartbeat(agentId, instanceId, olderSentAt, dryRun: true));
+
+        Assert.False(replay.Accepted);
+        var agents = await admin.GetFromJsonAsync<List<AgentListItem>>("/api/agents", JsonOptions);
+        var stored = Assert.Single(agents!, x => x.AgentId == agentId);
+        Assert.Equal(newerSentAt, stored.SentAt);
+        Assert.False(stored.DryRun);
+    }
+
+    [Fact]
+    public async Task Stale_non_dry_run_heartbeat_is_rejected_even_when_newer_state_is_dry_run()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAgentClient();
+        using var admin = factory.CreateAuthenticatedClient();
+        var agentId = $"ordered-safe-{Guid.NewGuid():N}";
+        var instanceId = $"wx-{Guid.NewGuid():N}";
+        var olderSentAt = DateTimeOffset.UtcNow.AddSeconds(-2);
+        var newerSentAt = olderSentAt.AddSeconds(1);
+
+        Assert.True((await PostHeartbeatAsync(
+            client,
+            CreateHeartbeat(agentId, instanceId, newerSentAt, dryRun: true))).Accepted);
+
+        var stale = await PostHeartbeatAsync(
+            client,
+            CreateHeartbeat(agentId, instanceId, olderSentAt, dryRun: false));
+
+        Assert.False(stale.Accepted);
+        var agents = await admin.GetFromJsonAsync<List<AgentListItem>>("/api/agents", JsonOptions);
+        var stored = Assert.Single(agents!, x => x.AgentId == agentId);
+        Assert.Equal(newerSentAt, stored.SentAt);
+        Assert.True(stored.DryRun);
+    }
+
+    [Fact]
+    public async Task Disabled_auto_registration_requires_admin_pre_registration()
+    {
+        using var factory = new TestApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Auth:AllowAgentAutoRegistration"] = "false"
+        });
+        using var agent = factory.CreateAgentClient();
+        using var admin = factory.CreateAuthenticatedClient();
+        var agentId = $"pre-registered-{Guid.NewGuid():N}";
+        var instanceId = $"wx-{Guid.NewGuid():N}";
+
+        using var unknown = await PostHeartbeatResponseAsync(
+            agent,
+            CreateHeartbeat(agentId, instanceId, DateTimeOffset.UtcNow));
+        Assert.Equal(HttpStatusCode.Conflict, unknown.StatusCode);
+        Assert.Contains("agent_not_registered", await unknown.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+
+        using var registered = await admin.PostAsJsonAsync(
+            "/api/agents",
+            new RegisterAgentRequest(agentId, instanceId, "production-1"),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Created, registered.StatusCode);
+
+        var accepted = await PostHeartbeatAsync(
+            agent,
+            CreateHeartbeat(agentId, instanceId, DateTimeOffset.UtcNow.AddMilliseconds(1)));
+        Assert.True(accepted.Accepted);
+        var agents = await admin.GetFromJsonAsync<List<AgentListItem>>("/api/agents", JsonOptions);
+        var stored = Assert.Single(agents!, x => x.AgentId == agentId);
+        Assert.Equal(instanceId, stored.WeChatInstanceId);
+        Assert.Equal("production-1", stored.ConfigurationVersion);
+    }
+
+    [Fact]
+    public async Task Admin_pre_registration_rejects_reusing_a_wechat_instance_for_another_agent()
+    {
+        using var factory = new TestApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Auth:AllowAgentAutoRegistration"] = "false"
+        });
+        using var admin = factory.CreateAuthenticatedClient();
+        var instanceId = $"wx-{Guid.NewGuid():N}";
+
+        using var first = await admin.PostAsJsonAsync(
+            "/api/agents",
+            new RegisterAgentRequest($"agent-a-{Guid.NewGuid():N}", instanceId, "production-1"),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Created, first.StatusCode);
+
+        using var duplicate = await admin.PostAsJsonAsync(
+            "/api/agents",
+            new RegisterAgentRequest($"agent-b-{Guid.NewGuid():N}", instanceId, "production-1"),
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Conflict, duplicate.StatusCode);
+        Assert.Contains(
+            "wechat_instance_already_registered",
+            await duplicate.Content.ReadAsStringAsync(),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Concurrent_first_heartbeats_create_one_registration()
     {
         using var factory = new TestApplicationFactory();
@@ -317,10 +434,12 @@ public sealed class AgentApiIntegrationTests
         await PostHeartbeatAsync(client, CreateHeartbeat(preservedAgentId, "wx-preserved", oldSentAt, queueDepth: 1));
         await PostHeartbeatAsync(client, CreateHeartbeat(restoredAgentId, "wx-restored", oldSentAt, queueDepth: 2));
 
-        var backupResponse = await admin.PostAsJsonAsync(
-            "/api/backups",
-            new CreateBackupRequest("agent backup scope"),
-            JsonOptions);
+        using var backupRequest = new HttpRequestMessage(HttpMethod.Post, "/api/backups")
+        {
+            Content = JsonContent.Create(new CreateBackupRequest("agent backup scope"), options: JsonOptions)
+        };
+        backupRequest.Headers.Add("Idempotency-Key", $"agent-backup-{Guid.NewGuid():N}");
+        var backupResponse = await admin.SendAsync(backupRequest);
         var backupBody = await backupResponse.Content.ReadAsStringAsync();
         Assert.True(backupResponse.IsSuccessStatusCode, backupBody);
         var backup = JsonSerializer.Deserialize<BackupItem>(backupBody, JsonOptions)!;

@@ -10,7 +10,17 @@ public class TestApplicationFactory : WebApplicationFactory<Program>
     public const string AgentApiKey = "test-agent-api-key-with-more-than-thirty-two-characters";
     public static readonly Guid TenantId = Guid.Parse("22222222-2222-2222-2222-222222222222");
     private readonly string _root = Path.Combine(Path.GetTempPath(), "wechatbot-backend-tests", Guid.NewGuid().ToString("N"));
+    private readonly IReadOnlyDictionary<string, string?>? _overrides;
     public string BackupDirectory => Path.Combine(_root, "backups");
+
+    public TestApplicationFactory()
+    {
+    }
+
+    internal TestApplicationFactory(IReadOnlyDictionary<string, string?> overrides)
+    {
+        _overrides = overrides;
+    }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -18,18 +28,24 @@ public class TestApplicationFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Testing");
         builder.ConfigureAppConfiguration((_, configuration) =>
         {
-            configuration.AddInMemoryCollection(new Dictionary<string, string?>
+            var values = new Dictionary<string, string?>
             {
                 ["ConnectionStrings:Database"] = $"Data Source={Path.Combine(_root, "test.db")};Default Timeout=30;Pooling=False",
                 ["Auth:ApiKey"] = ApiKey,
                 ["Auth:AgentApiKey"] = AgentApiKey,
                 ["Auth:TenantId"] = TenantId.ToString("D"),
                 ["Auth:ActorName"] = "integration-test-admin",
+                ["Auth:AllowAgentAutoRegistration"] = "true",
                 ["Activation:HashPepper"] = "integration-test-activation-pepper-32-characters-minimum",
                 ["Audit:IntegrityKey"] = "integration-test-audit-integrity-key-32-characters-minimum",
                 ["Backup:Directory"] = BackupDirectory,
                 ["Backup:EncryptionKeyBase64"] = Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData("integration-test-backup-key"u8.ToArray()))
-            });
+            };
+            if (_overrides is not null)
+            {
+                foreach (var pair in _overrides) values[pair.Key] = pair.Value;
+            }
+            configuration.AddInMemoryCollection(values);
         });
     }
 

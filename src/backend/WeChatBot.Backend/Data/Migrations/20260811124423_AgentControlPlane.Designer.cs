@@ -209,6 +209,9 @@ namespace WeChatBot.Backend.Data.Migrations
                     b.HasIndex("TenantId", "NormalizedAgentId")
                         .IsUnique();
 
+                    b.HasIndex("TenantId", "WeChatInstanceId")
+                        .IsUnique();
+
                     b.ToTable("AgentRegistrations");
                 });
 

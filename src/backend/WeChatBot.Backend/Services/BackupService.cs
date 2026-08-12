@@ -19,6 +19,8 @@ public sealed class BackupOptions
 
 public sealed record BackupVerification(Guid BackupId, bool IsValid, string ExpectedSha256, string ActualSha256, long Bytes);
 
+internal sealed record BackupCreateCheckpoint(Guid BackupId);
+
 public sealed record RestoreResult(
     Guid RestoreId,
     Guid BackupId,
@@ -31,12 +33,14 @@ public sealed record RestoreResult(
 
 internal sealed class LogicalBackupPayload
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
     public const int MinimumSupportedSchemaVersion = 1;
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
+    public Guid BackupId { get; set; }
     public Guid TenantId { get; set; }
     public DateTimeOffset ExportedAt { get; set; }
     public TenantState? Tenant { get; set; }
+    public List<ServicePackage> ServicePackages { get; set; } = [];
     public List<AgentRegistration> AgentRegistrations { get; set; } = [];
     public List<Contact> Contacts { get; set; } = [];
     public List<GroupChat> Groups { get; set; } = [];
@@ -57,6 +61,8 @@ public sealed class LogicalBackupService(
     AuditService audit)
 {
     private static readonly byte[] Magic = "WXB1"u8.ToArray();
+    private const string CreateOperation = "backup.create";
+    private static readonly SemaphoreSlim CreateGate = new(1, 1);
     private static readonly SemaphoreSlim RestoreGate = new(1, 1);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -65,7 +71,74 @@ public sealed class LogicalBackupService(
 
     public async Task<BackupManifest> CreateAsync(string reason, CancellationToken cancellationToken)
     {
+        await CreateGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await CreateCoreAsync(reason, null, null, cancellationToken);
+        }
+        finally
+        {
+            CreateGate.Release();
+        }
+    }
+
+    public async Task<BackupManifest> CreateIdempotentAsync(
+        string reason,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        reason = reason.Trim();
+        idempotencyKey = idempotencyKey?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128)
+        {
+            throw DomainException.Validation(
+                "invalid_idempotency_key",
+                "Idempotency-Key is required and must be at most 128 characters.");
+        }
+
+        var requestHash = StableHash.Sha256(reason);
+        await CreateGate.WaitAsync(cancellationToken);
+        try
+        {
+            var replay = await TryReadIdempotentCreateAsync(
+                idempotencyKey,
+                requestHash,
+                cancellationToken);
+            if (replay is not null) return replay;
+
+            try
+            {
+                return await CreateCoreAsync(
+                    reason,
+                    idempotencyKey,
+                    requestHash,
+                    cancellationToken);
+            }
+            catch (DbUpdateException)
+            {
+                db.ChangeTracker.Clear();
+                replay = await TryReadIdempotentCreateAsync(
+                    idempotencyKey,
+                    requestHash,
+                    cancellationToken);
+                if (replay is not null) return replay;
+                throw;
+            }
+        }
+        finally
+        {
+            CreateGate.Release();
+        }
+    }
+
+    private async Task<BackupManifest> CreateCoreAsync(
+        string reason,
+        string? idempotencyKey,
+        string? requestHash,
+        CancellationToken cancellationToken)
+    {
         var now = timeProvider.GetUtcNow();
+        var backupId = Guid.NewGuid();
         LogicalBackupPayload payload;
         await using (var snapshot = await db.Database.BeginTransactionAsync(
                          IsolationLevel.Serializable,
@@ -73,9 +146,11 @@ public sealed class LogicalBackupService(
         {
             payload = new LogicalBackupPayload
             {
+                BackupId = backupId,
                 TenantId = tenant.TenantId,
                 ExportedAt = now,
                 Tenant = await db.Tenants.AsNoTracking().SingleOrDefaultAsync(cancellationToken),
+                ServicePackages = await db.ServicePackages.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
                 AgentRegistrations = await db.AgentRegistrations.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
                 Contacts = await db.Contacts.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
                 Groups = await db.Groups.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
@@ -92,39 +167,179 @@ public sealed class LogicalBackupService(
 
         var plaintext = JsonSerializer.SerializeToUtf8Bytes(payload, JsonOptions);
         var encrypted = Encrypt(plaintext, GetEncryptionKey());
-        var backupId = Guid.NewGuid();
         var fileName = $"{tenant.TenantId:N}-{now:yyyyMMddHHmmss}-{backupId:N}.wxbak";
         var path = ResolvePath(fileName);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+        var deletePayloadOnFailure = true;
+        try
         {
-            await stream.WriteAsync(encrypted, cancellationToken);
-            await stream.FlushAsync(cancellationToken);
+            await using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+            {
+                await stream.WriteAsync(encrypted, cancellationToken);
+                await stream.FlushAsync(cancellationToken);
+            }
+
+            var counts = CalculateCounts(payload);
+            var manifest = new BackupManifest
+            {
+                Id = backupId,
+                TenantId = tenant.TenantId,
+                CreatedAt = now,
+                CreatedBy = tenant.Actor,
+                FileName = fileName,
+                PayloadSha256 = StableHash.Sha256(encrypted),
+                Bytes = encrypted.LongLength,
+                SchemaVersion = payload.SchemaVersion,
+                CountsJson = JsonSerializer.Serialize(counts, JsonOptions),
+                Status = BackupStatus.Created
+            };
+            db.BackupManifests.Add(manifest);
+            audit.Add("backup.created", nameof(BackupManifest), manifest.Id.ToString("D"), details: new
+            {
+                manifest.SchemaVersion,
+                manifest.Bytes,
+                reason,
+                counts
+            });
+            if (idempotencyKey is not null && requestHash is not null)
+            {
+                db.IdempotencyRecords.Add(new IdempotencyRecord
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenant.TenantId,
+                    Operation = CreateOperation,
+                    Key = idempotencyKey,
+                    RequestHash = requestHash,
+                    StatusCode = StatusCodes.Status201Created,
+                    ResponseJson = JsonSerializer.Serialize(new BackupCreateCheckpoint(manifest.Id), JsonOptions),
+                    CreatedAt = now,
+                    ExpiresAt = now.AddDays(7)
+                });
+            }
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken);
+            }
+            catch
+            {
+                db.ChangeTracker.Clear();
+                BackupManifest? committed;
+                try
+                {
+                    committed = await TryReadCommittedCreateAsync(
+                        backupId,
+                        idempotencyKey,
+                        requestHash,
+                        CancellationToken.None);
+                }
+                catch
+                {
+                    // Preserve the payload when the database cannot prove whether the commit succeeded.
+                    deletePayloadOnFailure = false;
+                    throw;
+                }
+                if (committed is not null) return committed;
+                throw;
+            }
+            return manifest;
+        }
+        catch
+        {
+            if (deletePayloadOnFailure)
+            {
+                try
+                {
+                    File.Delete(path);
+                }
+                catch (IOException)
+                {
+                    // A failed create remains failed; orphan cleanup can be retried operationally.
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Preserve the original creation error.
+                }
+            }
+            throw;
+        }
+    }
+
+    private async Task<BackupManifest?> TryReadIdempotentCreateAsync(
+        string idempotencyKey,
+        string requestHash,
+        CancellationToken cancellationToken)
+    {
+        var record = await db.IdempotencyRecords.AsNoTracking()
+            .SingleOrDefaultAsync(
+                x => x.Operation == CreateOperation && x.Key == idempotencyKey,
+                cancellationToken);
+        if (record is null) return null;
+        if (!HashEquals(record.RequestHash, requestHash))
+        {
+            throw DomainException.Conflict(
+                "idempotency_key_reused",
+                "The Idempotency-Key was already used for a different backup request.");
         }
 
-        var counts = CalculateCounts(payload);
-        var manifest = new BackupManifest
+        BackupCreateCheckpoint checkpoint;
+        try
         {
-            Id = backupId,
-            TenantId = tenant.TenantId,
-            CreatedAt = now,
-            CreatedBy = tenant.Actor,
-            FileName = fileName,
-            PayloadSha256 = StableHash.Sha256(encrypted),
-            Bytes = encrypted.LongLength,
-            SchemaVersion = payload.SchemaVersion,
-            CountsJson = JsonSerializer.Serialize(counts, JsonOptions),
-            Status = BackupStatus.Created
-        };
-        db.BackupManifests.Add(manifest);
-        audit.Add("backup.created", nameof(BackupManifest), manifest.Id.ToString("D"), details: new
+            checkpoint = JsonSerializer.Deserialize<BackupCreateCheckpoint>(record.ResponseJson, JsonOptions)
+                         ?? throw new JsonException("Backup checkpoint is empty.");
+        }
+        catch (JsonException)
         {
-            manifest.SchemaVersion,
-            manifest.Bytes,
-            reason,
-            counts
-        });
-        await db.SaveChangesAsync(cancellationToken);
+            throw DomainException.Conflict(
+                "backup_idempotency_inconsistent",
+                "The backup idempotency checkpoint is invalid and requires administrator review.");
+        }
+
+        return await db.BackupManifests.AsNoTracking()
+                   .SingleOrDefaultAsync(x => x.Id == checkpoint.BackupId, cancellationToken)
+               ?? throw DomainException.Conflict(
+                   "backup_idempotency_inconsistent",
+                   "The backup idempotency checkpoint does not reference an available manifest.");
+    }
+
+    private async Task<BackupManifest?> TryReadCommittedCreateAsync(
+        Guid backupId,
+        string? idempotencyKey,
+        string? requestHash,
+        CancellationToken cancellationToken)
+    {
+        var manifest = await db.BackupManifests.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.Id == backupId, cancellationToken);
+        if (manifest is null) return null;
+
+        if (idempotencyKey is not null && requestHash is not null)
+        {
+            var replay = await TryReadIdempotentCreateAsync(
+                idempotencyKey,
+                requestHash,
+                cancellationToken);
+            if (replay is null || replay.Id != backupId)
+            {
+                throw DomainException.Conflict(
+                    "backup_idempotency_inconsistent",
+                    "The committed backup does not match its idempotency checkpoint.");
+            }
+        }
+
+        var path = ResolvePath(manifest.FileName);
+        if (!File.Exists(path))
+        {
+            throw DomainException.Conflict(
+                "backup_payload_missing",
+                "The committed backup manifest has no payload file.");
+        }
+        var bytes = await File.ReadAllBytesAsync(path, cancellationToken);
+        if (bytes.LongLength != manifest.Bytes ||
+            !HashEquals(manifest.PayloadSha256, StableHash.Sha256(bytes)))
+        {
+            throw DomainException.Conflict(
+                "backup_payload_inconsistent",
+                "The committed backup payload does not match its manifest.");
+        }
         return manifest;
     }
 
@@ -250,6 +465,7 @@ public sealed class LogicalBackupService(
         tenantState.UpdatedAt = startedAt;
         tenantState.Version++;
 
+        restored["servicePackages"] = await RestoreServicePackagesAsync(payload.ServicePackages, cancellationToken);
         restored["agentRegistrations"] = await RestoreAgentRegistrationsAsync(payload.AgentRegistrations, cancellationToken);
         restored["contacts"] = await RestoreContactsAsync(payload.Contacts, cancellationToken);
         restored["groups"] = await RestoreGroupsAsync(payload.Groups, cancellationToken);
@@ -336,6 +552,7 @@ public sealed class LogicalBackupService(
         var existing = await db.AgentRegistrations.AsNoTracking().ToListAsync(cancellationToken);
         var existingIds = existing.Select(x => x.Id).ToHashSet();
         var existingAgentIds = existing.Select(x => x.NormalizedAgentId).ToHashSet(StringComparer.Ordinal);
+        var existingInstanceIds = existing.Select(x => x.WeChatInstanceId).ToHashSet(StringComparer.Ordinal);
         var restored = 0;
 
         foreach (var item in source.Where(x => x.TenantId == tenant.TenantId))
@@ -344,7 +561,8 @@ public sealed class LogicalBackupService(
             if (string.IsNullOrWhiteSpace(normalizedAgentId) ||
                 string.IsNullOrWhiteSpace(item.WeChatInstanceId) ||
                 existingIds.Contains(item.Id) ||
-                existingAgentIds.Contains(normalizedAgentId))
+                existingAgentIds.Contains(normalizedAgentId) ||
+                existingInstanceIds.Contains(item.WeChatInstanceId.Trim()))
             {
                 continue;
             }
@@ -358,9 +576,36 @@ public sealed class LogicalBackupService(
             db.AgentRegistrations.Add(item);
             existingIds.Add(item.Id);
             existingAgentIds.Add(normalizedAgentId);
+            existingInstanceIds.Add(item.WeChatInstanceId);
             restored++;
         }
 
+        return restored;
+    }
+
+    private async Task<int> RestoreServicePackagesAsync(
+        IReadOnlyCollection<ServicePackage> source,
+        CancellationToken cancellationToken)
+    {
+        var existing = await db.ServicePackages.ToDictionaryAsync(x => x.Id, cancellationToken);
+        var restored = 0;
+        foreach (var item in source)
+        {
+            if (existing.TryGetValue(item.Id, out var target))
+            {
+                target.Code = item.Code;
+                target.Name = item.Name;
+                target.Tier = item.Tier;
+                target.FeaturesJson = item.FeaturesJson;
+                target.IsEnabled = item.IsEnabled;
+                target.Version++;
+            }
+            else
+            {
+                db.ServicePackages.Add(item);
+            }
+            restored++;
+        }
         return restored;
     }
 
@@ -450,6 +695,7 @@ public sealed class LogicalBackupService(
         EnsurePayloadCollectionsArePresent(payload);
         if (!IsSupportedSchema(payload.SchemaVersion) ||
             payload.SchemaVersion != manifest.SchemaVersion ||
+            payload.SchemaVersion >= 3 && payload.BackupId != manifest.Id ||
             payload.TenantId != tenant.TenantId)
         {
             throw DomainException.Conflict(
@@ -472,6 +718,7 @@ public sealed class LogicalBackupService(
     private static void EnsurePayloadCollectionsArePresent(LogicalBackupPayload payload)
     {
         if (payload.AgentRegistrations is null ||
+            payload.ServicePackages is null ||
             payload.Contacts is null ||
             payload.Groups is null ||
             payload.RemarkRules is null ||
@@ -571,6 +818,18 @@ public sealed class LogicalBackupService(
 
         var containsInvalidIds =
             HasInvalidOrDuplicateIds(payload.AgentRegistrations, x => x.Id) ||
+            payload.AgentRegistrations.Any(x =>
+                string.IsNullOrWhiteSpace(x.AgentId) ||
+                string.IsNullOrWhiteSpace(x.WeChatInstanceId) ||
+                string.IsNullOrWhiteSpace(x.ConfigurationVersion)) ||
+            payload.AgentRegistrations
+                .Select(x => AgentControlService.NormalizeAgentId(x.AgentId))
+                .Distinct(StringComparer.Ordinal)
+                .Count() != payload.AgentRegistrations.Count ||
+            payload.AgentRegistrations
+                .Select(x => x.WeChatInstanceId.Trim())
+                .Distinct(StringComparer.Ordinal)
+                .Count() != payload.AgentRegistrations.Count ||
             HasInvalidOrDuplicateIds(payload.Contacts, x => x.Id) ||
             HasInvalidOrDuplicateIds(payload.Groups, x => x.Id) ||
             HasInvalidOrDuplicateIds(payload.RemarkRules, x => x.Id) ||
@@ -629,10 +888,33 @@ public sealed class LogicalBackupService(
             .Concat(payload.ActivationCodes.Select(x => x.PackageId))
             .Distinct()
             .ToArray();
-        var packages = await db.ServicePackages.AsNoTracking()
-            .Where(x => packageIds.Contains(x.Id))
-            .ToDictionaryAsync(x => x.Id, cancellationToken);
-        var invalidPackageReference = packages.Count != packageIds.Length;
+
+        if (payload.SchemaVersion >= 3 && HasInvalidServicePackageDefinitions(payload.ServicePackages))
+        {
+            throw DomainException.Conflict(
+                "backup_package_reference_invalid",
+                "Backup package definitions are invalid; restore was not started.");
+        }
+
+        var packages = payload.SchemaVersion >= 3
+            ? payload.ServicePackages.ToDictionary(x => x.Id)
+            : await db.ServicePackages.AsNoTracking()
+                .Where(x => packageIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, cancellationToken);
+        var invalidPackageReference = packageIds.Any(x => !packages.ContainsKey(x));
+        var packageIdentityConflict = false;
+        if (payload.SchemaVersion >= 3)
+        {
+            var packagesByCode = payload.ServicePackages.ToDictionary(
+                x => x.Code,
+                StringComparer.OrdinalIgnoreCase);
+            var existingPackages = await db.ServicePackages.AsNoTracking()
+                .Select(x => new { x.Id, x.Code })
+                .ToListAsync(cancellationToken);
+            packageIdentityConflict = existingPackages.Any(existing =>
+                packagesByCode.TryGetValue(existing.Code, out var restored) &&
+                restored.Id != existing.Id);
+        }
         var invalidAdvancedTarget = payload.Entitlements.Any(x =>
                 packages.TryGetValue(x.PackageId, out var package) &&
                 package.Tier == PackageTier.AdvancedGeneral &&
@@ -642,11 +924,42 @@ public sealed class LogicalBackupService(
                 packages.TryGetValue(x.PackageId, out var package) &&
                 package.Tier == PackageTier.AdvancedGeneral &&
                 x.RedeemedTargetKind != ServiceTargetKind.Group);
-        if (invalidPackageReference || invalidAdvancedTarget)
+        if (invalidPackageReference || packageIdentityConflict || invalidAdvancedTarget)
         {
             throw DomainException.Conflict(
                 "backup_package_reference_invalid",
-                "Backup records reference a missing package or an unsupported package target; restore was not started.");
+                "Backup package identities or references conflict with the restore target; restore was not started.");
+        }
+    }
+
+    private static bool HasInvalidServicePackageDefinitions(IReadOnlyCollection<ServicePackage> source)
+    {
+        if (source.Any(x => x is null)) return true;
+
+        return HasInvalidOrDuplicateIds(source, x => x.Id) ||
+               source.Select(x => x.Code).Distinct(StringComparer.OrdinalIgnoreCase).Count() != source.Count ||
+               source.Any(x =>
+                   string.IsNullOrWhiteSpace(x.Code) || x.Code.Length > 64 ||
+                   string.IsNullOrWhiteSpace(x.Name) || x.Name.Length > 128 ||
+                   !Enum.IsDefined(x.Tier) ||
+                   !IsValidFeatureJson(x.FeaturesJson) ||
+                   x.Version < 1);
+    }
+
+    private static bool IsValidFeatureJson(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+
+        try
+        {
+            using var document = JsonDocument.Parse(value);
+            return document.RootElement.ValueKind == JsonValueKind.Array &&
+                   document.RootElement.EnumerateArray().All(x =>
+                       x.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(x.GetString()));
+        }
+        catch (JsonException)
+        {
+            return false;
         }
     }
 
@@ -801,6 +1114,10 @@ public sealed class LogicalBackupService(
         if (payload.SchemaVersion >= 2)
         {
             counts["agentRegistrations"] = payload.AgentRegistrations.Count;
+        }
+        if (payload.SchemaVersion >= 3)
+        {
+            counts["servicePackages"] = payload.ServicePackages.Count;
         }
         return counts;
     }

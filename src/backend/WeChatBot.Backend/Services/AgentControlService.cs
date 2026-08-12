@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using WeChatBot.Backend.Contracts;
 using WeChatBot.Backend.Data;
 using WeChatBot.Backend.Domain;
@@ -10,7 +11,8 @@ public sealed class AgentControlService(
     AppDbContext db,
     TenantContext tenant,
     TimeProvider timeProvider,
-    AuditService audit)
+    AuditService audit,
+    IOptions<AuthOptions> authOptions)
 {
     private static readonly TimeSpan MaximumClockSkew = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MaximumHeartbeatAge = TimeSpan.FromMinutes(2);
@@ -73,9 +75,13 @@ public sealed class AgentControlService(
             return new AgentHeartbeatResponse(false, emergencyStop, registration.ConfigurationVersion);
         }
 
-        await UpsertHeartbeatStateAsync(registration.Id, request, now, cancellationToken);
+        var authoritativeDryRun = await UpsertHeartbeatStateAsync(
+            registration.Id,
+            request,
+            now,
+            cancellationToken);
         return new AgentHeartbeatResponse(
-            registration.IsEnabled && request.DryRun,
+            registration.IsEnabled && request.DryRun && authoritativeDryRun,
             emergencyStop,
             registration.ConfigurationVersion);
     }
@@ -174,7 +180,117 @@ public sealed class AgentControlService(
         }).ToList();
     }
 
+    public async Task<AgentListItem> RegisterAsync(
+        RegisterAgentRequest request,
+        CancellationToken cancellationToken)
+    {
+        var agentId = request.AgentId.Trim();
+        var normalizedAgentId = NormalizeAgentId(agentId);
+        var weChatInstanceId = request.WeChatInstanceId.Trim();
+        var configurationVersion = request.ConfigurationVersion.Trim();
+        var existing = await db.AgentRegistrations.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.NormalizedAgentId == normalizedAgentId, cancellationToken);
+        if (existing is not null)
+        {
+            if (!string.Equals(existing.AgentId, agentId, StringComparison.Ordinal) ||
+                !string.Equals(existing.WeChatInstanceId, weChatInstanceId, StringComparison.Ordinal) ||
+                !string.Equals(existing.ConfigurationVersion, configurationVersion, StringComparison.Ordinal))
+            {
+                throw DomainException.Conflict(
+                    "agent_registration_conflict",
+                    "The AgentId is already registered with different immutable registration data.");
+            }
+            return ToListItem(existing, null, timeProvider.GetUtcNow() - OnlineWindow);
+        }
+        var existingInstance = await db.AgentRegistrations.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.WeChatInstanceId == weChatInstanceId, cancellationToken);
+        if (existingInstance is not null)
+        {
+            throw DomainException.Conflict(
+                "wechat_instance_already_registered",
+                "The WeChatInstanceId is already registered to another AgentId.");
+        }
+
+        var now = timeProvider.GetUtcNow();
+        var registration = new AgentRegistration
+        {
+            Id = Guid.NewGuid(),
+            TenantId = tenant.TenantId,
+            AgentId = agentId,
+            NormalizedAgentId = normalizedAgentId,
+            WeChatInstanceId = weChatInstanceId,
+            IsEnabled = true,
+            ConfigurationVersion = configurationVersion,
+            RegisteredAt = now,
+            UpdatedAt = now
+        };
+        db.AgentRegistrations.Add(registration);
+        audit.Add(
+            "agent.pre-registered",
+            nameof(AgentRegistration),
+            registration.Id.ToString("D"),
+            details: new
+            {
+                registration.AgentId,
+                registration.WeChatInstanceId,
+                registration.ConfigurationVersion
+            });
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            db.ChangeTracker.Clear();
+            existing = await db.AgentRegistrations.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.NormalizedAgentId == normalizedAgentId, cancellationToken);
+            if (existing is not null &&
+                string.Equals(existing.AgentId, agentId, StringComparison.Ordinal) &&
+                string.Equals(existing.WeChatInstanceId, weChatInstanceId, StringComparison.Ordinal) &&
+                string.Equals(existing.ConfigurationVersion, configurationVersion, StringComparison.Ordinal))
+            {
+                return ToListItem(existing, null, now - OnlineWindow);
+            }
+            existingInstance = await db.AgentRegistrations.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.WeChatInstanceId == weChatInstanceId, cancellationToken);
+            if (existingInstance is not null)
+            {
+                throw DomainException.Conflict(
+                    "wechat_instance_already_registered",
+                    "The WeChatInstanceId is already registered to another AgentId.");
+            }
+            throw;
+        }
+        return ToListItem(registration, null, now - OnlineWindow);
+    }
+
     public static string NormalizeAgentId(string agentId) => agentId.Trim().ToUpperInvariant();
+
+    private static AgentListItem ToListItem(
+        AgentRegistration registration,
+        AgentHeartbeatState? state,
+        DateTimeOffset onlineAfter) => new(
+        registration.Id,
+        registration.AgentId,
+        registration.WeChatInstanceId,
+        registration.IsEnabled,
+        registration.ConfigurationVersion,
+        registration.RegisteredAt,
+        registration.UpdatedAt,
+        registration.Version,
+        state?.SentAt,
+        state?.ReceivedAt,
+        state?.RuntimeState,
+        state?.ReasonCode,
+        state?.Reason,
+        state?.ChangedAt,
+        state?.LastCommandCompletedAt,
+        state?.LastCommandCode,
+        state?.QueueDepth,
+        state?.ActiveExecutions,
+        state?.DryRun,
+        state?.AgentVersion,
+        registration.IsEnabled && state?.ReceivedAt >= onlineAfter);
 
     private async Task<AgentRegistration> EnsureRegistrationAsync(
         string agentId,
@@ -186,6 +302,12 @@ public sealed class AgentControlService(
         var existing = await db.AgentRegistrations
             .SingleOrDefaultAsync(x => x.NormalizedAgentId == normalizedAgentId, cancellationToken);
         if (existing is not null) return existing;
+        if (!authOptions.Value.AllowAgentAutoRegistration)
+        {
+            throw DomainException.Conflict(
+                "agent_not_registered",
+                "The Agent must be pre-registered before it can establish a heartbeat lease.");
+        }
 
         var registration = new AgentRegistration
         {
@@ -217,11 +339,19 @@ public sealed class AgentControlService(
             existing = await db.AgentRegistrations
                 .SingleOrDefaultAsync(x => x.NormalizedAgentId == normalizedAgentId, cancellationToken);
             if (existing is not null) return existing;
+            var existingInstance = await db.AgentRegistrations
+                .SingleOrDefaultAsync(x => x.WeChatInstanceId == weChatInstanceId, cancellationToken);
+            if (existingInstance is not null)
+            {
+                throw DomainException.Conflict(
+                    "wechat_instance_already_registered",
+                    "The WeChatInstanceId is already registered to another AgentId.");
+            }
             throw;
         }
     }
 
-    private async Task UpsertHeartbeatStateAsync(
+    private async Task<bool> UpsertHeartbeatStateAsync(
         Guid registrationId,
         AgentHeartbeatRequest request,
         DateTimeOffset receivedAt,
@@ -231,7 +361,7 @@ public sealed class AgentControlService(
         {
             var state = await db.AgentHeartbeatStates
                 .SingleOrDefaultAsync(x => x.AgentRegistrationId == registrationId, cancellationToken);
-            if (state is not null && request.SentAt <= state.SentAt) return;
+            if (state is not null && request.SentAt <= state.SentAt) return state.DryRun;
 
             if (state is null)
             {
@@ -247,7 +377,7 @@ public sealed class AgentControlService(
             try
             {
                 await db.SaveChangesAsync(cancellationToken);
-                return;
+                return state.DryRun;
             }
             catch (DbUpdateException) when (attempt < HeartbeatUpdateAttempts - 1)
             {

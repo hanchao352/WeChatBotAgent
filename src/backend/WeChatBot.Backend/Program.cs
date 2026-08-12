@@ -149,6 +149,9 @@ static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvi
         configuration["Backup:EncryptionKeyBase64"] = EmptyOrExisting(
             configuration["Backup:EncryptionKeyBase64"],
             Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes("local-backup-key-change-before-production"))));
+        configuration["Auth:AllowAgentAutoRegistration"] = EmptyOrExisting(
+            configuration["Auth:AllowAgentAutoRegistration"],
+            "true");
     }
 
     RequireSecret(configuration["Auth:ApiKey"], "Auth__ApiKey", 32);
@@ -177,6 +180,44 @@ static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvi
     }
     if (!Guid.TryParse(configuration["Auth:TenantId"], out var tenantId) || tenantId == Guid.Empty)
         throw new InvalidOperationException("Auth__TenantId must contain a non-empty GUID.");
+    if (!localEnvironment)
+    {
+        if (tenantId == Guid.Parse("11111111-1111-1111-1111-111111111111") ||
+            string.Equals(configuration["Auth:ActorName"]?.Trim(), "local-admin", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(configuration["Auth:AgentActorName"]?.Trim(), "local-agent", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Production must override the development tenant and actor identities.");
+        }
+        RejectDevelopmentSecret(
+            configuration["Auth:ApiKey"],
+            "wechatbot-local-development-key-change-me",
+            "Auth__ApiKey");
+        RejectDevelopmentSecret(
+            configuration["Auth:AgentApiKey"],
+            "wechatbot-local-agent-development-key-change-me",
+            "Auth__AgentApiKey");
+        RejectDevelopmentSecret(
+            configuration["Activation:HashPepper"],
+            "local-activation-pepper-change-before-production-2026",
+            "Activation__HashPepper");
+        RejectDevelopmentSecret(
+            configuration["Audit:IntegrityKey"],
+            "local-audit-integrity-key-change-before-production-2026",
+            "Audit__IntegrityKey");
+        RejectDevelopmentSecret(
+            configuration["Backup:EncryptionKeyBase64"],
+            Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes("local-backup-key-change-before-production"))),
+            "Backup__EncryptionKeyBase64");
+        if (!bool.TryParse(configuration["Auth:AllowAgentAutoRegistration"], out var allowAgentAutoRegistration) ||
+            allowAgentAutoRegistration)
+        {
+            throw new InvalidOperationException(
+                "Production Auth__AllowAgentAutoRegistration must be explicitly set to false.");
+        }
+        RequireAbsoluteSqlitePath(configuration.GetConnectionString("Database"));
+        RequireAbsoluteDirectory(configuration["Backup:Directory"], "Backup__Directory");
+    }
 }
 
 static string EmptyOrExisting(string? current, string fallback) => string.IsNullOrWhiteSpace(current) ? fallback : current;
@@ -196,6 +237,15 @@ static void RequireActor(string? value, string environmentVariable)
     }
 }
 
+static void RejectDevelopmentSecret(string? value, string developmentValue, string environmentVariable)
+{
+    if (string.Equals(value, developmentValue, StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException(
+            $"Production {environmentVariable} must not use the public development credential.");
+    }
+}
+
 static void EnsureSqliteDirectory(string? connectionString)
 {
     if (string.IsNullOrWhiteSpace(connectionString)) throw new InvalidOperationException("ConnectionStrings__Database is required.");
@@ -203,6 +253,24 @@ static void EnsureSqliteDirectory(string? connectionString)
     if (string.IsNullOrWhiteSpace(parsed.DataSource) || parsed.DataSource == ":memory:") return;
     var fullPath = Path.GetFullPath(parsed.DataSource);
     Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+}
+
+static void RequireAbsoluteSqlitePath(string? connectionString)
+{
+    if (string.IsNullOrWhiteSpace(connectionString))
+        throw new InvalidOperationException("ConnectionStrings__Database is required.");
+    var parsed = new SqliteConnectionStringBuilder(connectionString);
+    if (string.IsNullOrWhiteSpace(parsed.DataSource) || !Path.IsPathFullyQualified(parsed.DataSource))
+    {
+        throw new InvalidOperationException(
+            "Production ConnectionStrings__Database must use an absolute SQLite data source path.");
+    }
+}
+
+static void RequireAbsoluteDirectory(string? path, string environmentVariable)
+{
+    if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+        throw new InvalidOperationException($"Production {environmentVariable} must be an absolute path.");
 }
 
 public partial class Program;

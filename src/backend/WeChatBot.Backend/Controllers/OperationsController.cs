@@ -27,9 +27,15 @@ public sealed class BackupsController(AppDbContext db, LogicalBackupService back
     }
 
     [HttpPost]
-    public async Task<ActionResult<BackupManifest>> Create(CreateBackupRequest request, CancellationToken cancellationToken)
+    public async Task<ActionResult<BackupManifest>> Create(
+        CreateBackupRequest request,
+        [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
+        CancellationToken cancellationToken)
     {
-        var manifest = await backups.CreateAsync(request.Reason?.Trim() ?? "manual", cancellationToken);
+        var manifest = await backups.CreateIdempotentAsync(
+            request.Reason?.Trim() ?? "manual",
+            idempotencyKey ?? string.Empty,
+            cancellationToken);
         return CreatedAtAction(nameof(Get), new { id = manifest.Id }, manifest);
     }
 
@@ -63,15 +69,19 @@ public sealed class AuditLogsController(AppDbContext db, AuditService audit) : C
         CancellationToken cancellationToken = default)
     {
         if (take is < 1 or > 500) throw DomainException.Validation("invalid_page_size", "take must be between 1 and 500.");
+        await foreach (var entry in db.AuditLogs.AsNoTracking().AsAsyncEnumerable().WithCancellation(cancellationToken))
+        {
+            if (!audit.HasValidIntegrity(entry))
+            {
+                throw DomainException.Conflict(
+                    "audit_integrity_failed",
+                    "One or more audit records failed integrity verification.");
+            }
+        }
+
         var query = db.AuditLogs.AsNoTracking();
         if (!string.IsNullOrWhiteSpace(action)) query = query.Where(x => x.Action == action);
         var entries = await query.OrderByDescending(x => x.CreatedAt).Take(take).ToListAsync(cancellationToken);
-        if (entries.Any(x => !audit.HasValidIntegrity(x)))
-        {
-            throw DomainException.Conflict(
-                "audit_integrity_failed",
-                "One or more audit records failed integrity verification.");
-        }
         return Ok(entries);
     }
 }

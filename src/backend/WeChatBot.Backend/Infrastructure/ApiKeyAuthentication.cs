@@ -14,6 +14,7 @@ public sealed class AuthOptions
     public Guid TenantId { get; set; }
     public string ActorName { get; set; } = "admin";
     public string AgentActorName { get; set; } = "agent";
+    public bool AllowAgentAutoRegistration { get; set; }
 }
 
 public sealed class ApiKeyAuthenticationHandler(

@@ -112,7 +112,7 @@ public sealed class ApiIntegrationTests : IClassFixture<TestApplicationFactory>
     {
         using var client = _factory.CreateAuthenticatedClient();
         var contact = await CreateContactAsync(client, $"backup-{Guid.NewGuid():N}", "Before backup");
-        var backupResponse = await client.PostAsJsonAsync("/api/backups", new CreateBackupRequest("integration test"), JsonOptions);
+        var backupResponse = await CreateBackupResponseAsync(client, "integration test");
         Assert.Equal(HttpStatusCode.Created, backupResponse.StatusCode);
         var manifest = await backupResponse.Content.ReadFromJsonAsync<BackupItem>(JsonOptions);
         Assert.NotNull(manifest);
@@ -265,7 +265,7 @@ public sealed class ApiIntegrationTests : IClassFixture<TestApplicationFactory>
         var issueResponse = await client.PostAsJsonAsync("/api/activation-codes", new IssueActivationCodeRequest(
             "BASIC", ServiceDurationKind.Days60, null), JsonOptions);
         var issued = await issueResponse.Content.ReadFromJsonAsync<IssuedCode>(JsonOptions);
-        var backupResponse = await client.PostAsJsonAsync("/api/backups", new CreateBackupRequest("before redemption"), JsonOptions);
+        var backupResponse = await CreateBackupResponseAsync(client, "before redemption");
         var backup = await backupResponse.Content.ReadFromJsonAsync<BackupItem>(JsonOptions);
 
         async Task<HttpResponseMessage> RedeemAsync(string key)
@@ -316,6 +316,16 @@ public sealed class ApiIntegrationTests : IClassFixture<TestApplicationFactory>
         var body = await response.Content.ReadAsStringAsync();
         Assert.True(response.IsSuccessStatusCode, body);
         return JsonSerializer.Deserialize<ContactItem>(body, JsonOptions)!;
+    }
+
+    private static Task<HttpResponseMessage> CreateBackupResponseAsync(HttpClient client, string reason)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/api/backups")
+        {
+            Content = JsonContent.Create(new CreateBackupRequest(reason), options: JsonOptions)
+        };
+        request.Headers.Add("Idempotency-Key", $"backup-{Guid.NewGuid():N}");
+        return client.SendAsync(request);
     }
 
     private static async Task ActivateTargetAsync(

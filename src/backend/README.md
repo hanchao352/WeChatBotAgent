@@ -40,7 +40,7 @@ X-Api-Key: wechatbot-local-development-key-change-me
 - Agent Key（`Auth__AgentApiKey`）仅用于 Agent 向控制面提交心跳，以及在匹配的健康 dry-run 绑定下上报群消息；不授予任何 Admin 接口权限。
 - `Auth__ActorName` 和 `Auth__AgentActorName` 分别标识管理员与 Agent 的审计主体，不能用同一角色名掩盖调用来源。
 
-当前版本的 Agent Key 是所有 Agent 共享的基线凭据，只适合受控网络内的初始部署。正式商业生产环境必须升级为设备预注册的独立凭据或客户端证书，使每台设备可单独识别、轮换和吊销；共享 Agent Key 不能作为最终生产身份方案。
+当前版本的 Agent Key 是所有 Agent 共享的基线凭据，只适合受控网络内的初始部署。预注册会强制一个微信实例只能绑定一个 AgentId，但共享 Agent Key 仍可冒用已知 AgentId，因此正式商业生产环境必须升级为设备独立凭据或客户端证书，使每台设备可单独识别、轮换和吊销；共享 Agent Key 不能作为最终生产身份方案。
 
 ## 生产环境必填配置
 
@@ -52,6 +52,7 @@ $env:Auth__AgentApiKey = '<至少 32 个字符的 Agent 随机密钥>'
 $env:Auth__TenantId = '<非空 GUID>'
 $env:Auth__ActorName = 'production-admin'
 $env:Auth__AgentActorName = 'production-agent'
+$env:Auth__AllowAgentAutoRegistration = 'false'
 $env:Activation__HashPepper = '<至少 32 个字符的随机密钥>'
 $env:Audit__IntegrityKey = '<至少 32 个字符的随机密钥>'
 $env:Backup__EncryptionKeyBase64 = '<32 字节随机值的 Base64>'
@@ -78,7 +79,7 @@ $env:ConnectionStrings__Database = 'Data Source=D:\WeChatBotData\wechatbot.db;De
 | 群 @ 事件 | `/api/group-mentions` |
 | Agent 心跳（Agent 角色） | `POST /api/agents/heartbeat` |
 | Agent 群消息上报（Agent 角色） | `POST /api/agents/{agentId}/group-mentions` |
-| Agent 列表（Admin 角色） | `GET /api/agents` |
+| Agent 预注册/列表（Admin 角色） | `POST /api/agents`、`GET /api/agents` |
 | 服务包/权益 | `/api/service-packages`、`/api/entitlements` |
 | 激活码 | `/api/activation-codes`、`/api/activation-codes/redeem` |
 | 审计 | `/api/audit-logs` |
@@ -86,7 +87,7 @@ $env:ConnectionStrings__Database = 'Data Source=D:\WeChatBotData\wechatbot.db;De
 | 自动化总状态 | `/api/system-state`、`/api/system-state/automation` |
 | 健康检查 | `/health/live`、`/health/ready` |
 
-激活兑换、备注任务创建和备份恢复要求 `Idempotency-Key` 请求头。恢复还要求正文中的 `confirmation` 精确为 `RESTORE`；恢复采用合并策略，不覆盖当前数据库中更可信的兑换、撤销和权益流水，并始终将自动化状态置为暂停，需人工核对后显式恢复。
+激活兑换、备注任务创建、手工备份创建和备份恢复要求 `Idempotency-Key` 请求头。生产环境必须关闭 Agent 自动注册，由管理员先调用 `POST /api/agents` 绑定 AgentId 与微信实例，再允许该 Agent 建立心跳。恢复还要求正文中的 `confirmation` 精确为 `RESTORE`；恢复采用合并策略，不覆盖当前数据库中更可信的兑换、撤销和权益流水，并始终将自动化状态置为暂停，需人工核对后显式恢复。
 
 当前没有向 Agent 角色开放备注任务领取或结果回报。`RemarkTask` 还缺少认领 Agent、不可猜测的租约令牌、租约到期时间、尝试次数和结果去重标识；在这些字段及原子认领/续租/完成协议通过数据库迁移落地前，多 Agent 消费会存在重复执行和越权回报风险。现有 `/api/remark-tasks/{id}/complete` 是管理员业务接口，不是 Agent 执行协议。
 

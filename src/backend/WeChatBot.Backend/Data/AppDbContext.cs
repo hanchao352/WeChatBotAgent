@@ -45,6 +45,7 @@ public sealed class AppDbContext(
         {
             entity.HasKey(x => x.Id);
             entity.HasIndex(x => new { x.TenantId, x.NormalizedAgentId }).IsUnique();
+            entity.HasIndex(x => new { x.TenantId, x.WeChatInstanceId }).IsUnique();
             entity.Property(x => x.AgentId).HasMaxLength(128).IsRequired();
             entity.Property(x => x.NormalizedAgentId).HasMaxLength(128).IsRequired();
             entity.Property(x => x.WeChatInstanceId).HasMaxLength(128).IsRequired();

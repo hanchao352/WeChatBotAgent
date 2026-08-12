@@ -159,10 +159,6 @@ export type ConsoleSnapshot = {
   audits: ApiAudit[]
 }
 
-function idempotencyKey(prefix: string) {
-  return `${prefix}-${crypto.randomUUID()}`
-}
-
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   if (apiKey) headers.set('X-Api-Key', apiKey)
@@ -220,21 +216,32 @@ export async function setAutomationState(
   })
 }
 
-export async function queueRemarkTask(ruleId: string, targetId: string): Promise<ApiRemarkTask> {
+export async function queueRemarkTask(
+  ruleId: string,
+  targetId: string,
+  operationKey: string,
+): Promise<ApiRemarkTask> {
   return request<ApiRemarkTask>('/api/remark-tasks', {
     method: 'POST',
-    headers: { 'Idempotency-Key': idempotencyKey('remark') },
+    headers: { 'Idempotency-Key': operationKey },
     body: JSON.stringify({ ruleId, targetId }),
   })
 }
 
-export async function createLogicalBackup(reason: string): Promise<ApiBackupVerification> {
+export async function createLogicalBackup(
+  reason: string,
+  operationKey: string,
+): Promise<ApiBackupVerification> {
   const created = await request<ApiBackup>('/api/backups', {
     method: 'POST',
-    headers: { 'Idempotency-Key': idempotencyKey('backup') },
+    headers: { 'Idempotency-Key': operationKey },
     body: JSON.stringify({ reason }),
   })
-  return request<ApiBackupVerification>(`/api/backups/${created.id}/verify`, { method: 'POST' })
+  const verification = await request<ApiBackupVerification>(`/api/backups/${created.id}/verify`, { method: 'POST' })
+  if (!verification.isValid) {
+    throw new Error(`备份 ${created.id} 完整性校验失败，已标记为损坏`)
+  }
+  return verification
 }
 
 export async function createControlledMergeRestore(backupId: string, operationKey: string) {

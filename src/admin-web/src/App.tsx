@@ -276,7 +276,7 @@ function TargetsPage({
   remarkRules: ApiRemarkRule[]
   remarkTasks: ApiRemarkTask[]
   apiConnected: boolean
-  onQueueRemark: (ruleId: string, targetId: string) => Promise<ApiRemarkTask>
+  onQueueRemark: (ruleId: string, targetId: string, operationKey: string) => Promise<ApiRemarkTask>
 }) {
   const [tab, setTab] = useState<TargetType>('group')
   const [query, setQuery] = useState('')
@@ -285,10 +285,12 @@ function TargetsPage({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const remarkAttempt = useRef<{ signature: string; key: string } | null>(null)
   const filtered = targets.filter((item) => item.type === tab && `${item.name}${item.remark}${item.account}`.toLowerCase().includes(query.toLowerCase()))
   const matchingRules = editing ? remarkRules.filter((item) => item.targetKind === editing.type && item.isEnabled) : []
   const openEditor = (target: Target) => {
     const firstRule = remarkRules.find((item) => item.targetKind === target.type && item.isEnabled)
+    remarkAttempt.current = null
     setEditing(target); setRuleId(firstRule?.id ?? ''); setError('')
   }
   const latestTask = (targetId: string) => remarkTasks.find((item) => item.targetId === targetId)
@@ -297,7 +299,22 @@ function TargetsPage({
     setSubmitting(true); setError('')
     try {
       if (!apiConnected || !ruleId) return
-      const task = await onQueueRemark(ruleId, editing.id)
+      const reconciled = remarkTasks.find((item) =>
+        item.ruleId === ruleId &&
+        item.targetId === editing.id &&
+        (item.status === 'pending' || item.status === 'conflict'))
+      if (reconciled) {
+        remarkAttempt.current = null
+        setNotice(`备注任务 ${reconciled.id.slice(0, 12)} 已在队列中：${reconciled.generatedRemark}`)
+        setEditing(null)
+        return
+      }
+      const signature = `${ruleId}:${editing.id}`
+      if (remarkAttempt.current?.signature !== signature) {
+        remarkAttempt.current = { signature, key: `remark-${crypto.randomUUID()}` }
+      }
+      const task = await onQueueRemark(ruleId, editing.id, remarkAttempt.current.key)
+      remarkAttempt.current = null
       setNotice(`备注任务 ${task.id.slice(0, 12)} 已创建：${task.generatedRemark}`)
       setEditing(null)
     } catch (queueError) {
@@ -305,6 +322,11 @@ function TargetsPage({
     } finally {
       setSubmitting(false)
     }
+  }
+  const closeEditor = () => {
+    remarkAttempt.current = null
+    setEditing(null)
+    setError('')
   }
   return (
     <div className="page-stack">
@@ -319,7 +341,7 @@ function TargetsPage({
         </tbody></table></div>
         <footer className="table-footer"><span>共 {filtered.length} 条</span><span>{apiConnected ? `后端任务 ${remarkTasks.length} 个` : '离线只读'}</span></footer>
       </section>
-      {editing && <Modal title="创建备注同步任务" onClose={() => setEditing(null)}><div className="modal-body"><div className="target-summary"><span className={`identity-icon ${editing.type}`}>{editing.type === 'group' ? <Group size={17} /> : <ContactRound size={17} />}</span><div><strong>{editing.name}</strong><small>{editing.account} · {editing.id}</small></div></div><label className="field"><span>备注规则</span><select aria-label="备注规则" value={ruleId} onChange={(event) => setRuleId(event.target.value)} autoFocus><option value="">选择已启用的规则</option>{matchingRules.map((rule) => <option value={rule.id} key={rule.id}>{rule.name} · {rule.template}</option>)}</select></label><div className="notice"><ShieldCheck size={17} /><span>任务进入后端队列后，只有通过微信目标身份二次校验并由 Agent 回报一致结果，系统备注才会更新。</span></div>{error && <div className="danger-notice"><CircleAlert size={18} /><div><strong>创建失败</strong><span>{error}</span></div></div>}</div><footer className="modal-footer"><button className="secondary-button" onClick={() => setEditing(null)}>取消</button><button className="primary-button" onClick={() => void saveRemark()} disabled={!apiConnected || submitting || !ruleId}><Check size={16} />{submitting ? '处理中' : '确认排队'}</button></footer></Modal>}
+      {editing && <Modal title="创建备注同步任务" onClose={closeEditor}><div className="modal-body"><div className="target-summary"><span className={`identity-icon ${editing.type}`}>{editing.type === 'group' ? <Group size={17} /> : <ContactRound size={17} />}</span><div><strong>{editing.name}</strong><small>{editing.account} · {editing.id}</small></div></div><label className="field"><span>备注规则</span><select aria-label="备注规则" value={ruleId} onChange={(event) => { remarkAttempt.current = null; setRuleId(event.target.value) }} autoFocus><option value="">选择已启用的规则</option>{matchingRules.map((rule) => <option value={rule.id} key={rule.id}>{rule.name} · {rule.template}</option>)}</select></label><div className="notice"><ShieldCheck size={17} /><span>任务进入后端队列后，只有通过微信目标身份二次校验并由 Agent 回报一致结果，系统备注才会更新。</span></div>{error && <div className="danger-notice"><CircleAlert size={18} /><div><strong>创建失败</strong><span>{error}</span></div></div>}</div><footer className="modal-footer"><button className="secondary-button" onClick={closeEditor}>取消</button><button className="primary-button" onClick={() => void saveRemark()} disabled={!apiConnected || submitting || !ruleId}><Check size={16} />{submitting ? '处理中' : '确认排队'}</button></footer></Modal>}
     </div>
   )
 }
@@ -405,7 +427,7 @@ function BackupsPage({
 }: {
   backups: Backup[]
   apiConnected: boolean
-  onCreate: () => Promise<void>
+  onCreate: (operationKey: string) => Promise<void>
   onRestore: (id: string, operationKey: string) => Promise<void>
 }) {
   const [restore, setRestore] = useState<Backup | null>(null)
@@ -414,10 +436,16 @@ function BackupsPage({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const restoreAttempt = useRef<{ backupId: string; key: string } | null>(null)
+  const createAttempt = useRef<string | null>(null)
   const createBackup = async () => {
     if (!apiConnected) return
     setBusy(true); setError('')
-    try { await onCreate(); setNotice('备份创建并校验通过') }
+    try {
+      createAttempt.current ??= `backup-${crypto.randomUUID()}`
+      await onCreate(createAttempt.current)
+      createAttempt.current = null
+      setNotice('备份创建并校验通过')
+    }
     catch (backupError) { setError(backupError instanceof Error ? backupError.message : '备份创建失败') }
     finally { setBusy(false) }
   }
@@ -442,7 +470,7 @@ function BackupsPage({
     setConfirm('')
     setError('')
   }
-  return <div className="page-stack"><section className="backup-summary"><div><ShieldCheck size={21} /><span>备份策略</span><strong>{apiConnected ? '正常' : '状态未知'}</strong><small>每次恢复前自动再备份</small></div><div><DatabaseBackup size={21} /><span>最近备份</span><strong>{backups.length ? backups[0].createdAt : '暂无'}</strong><small>{apiConnected ? '后端清单已连接' : '仅显示最后快照'}</small></div><div><ArchiveRestore size={21} /><span>恢复模式</span><strong>受控合并</strong><small>修改当前库并强制暂停自动化</small></div></section>{notice && <div className="toast-inline" role="status"><Check size={16} />{notice}<button title="关闭" aria-label="关闭" onClick={() => setNotice('')}><X size={15} /></button></div>}{error && <div className="error-inline" role="alert"><CircleAlert size={16} />{error}<button title="关闭" aria-label="关闭" onClick={() => setError('')}><X size={15} /></button></div>}<section className="panel data-panel"><div className="panel-header toolbar-heading"><div><h2>备份记录</h2><p>恢复会修改当前库；机器人保持暂停，旧发送任务不会自动重放</p></div><button className="primary-button" disabled={!apiConnected || busy} onClick={() => void createBackup()}><DatabaseBackup size={16} />{busy ? '处理中' : '立即备份'}</button></div><div className="table-wrap"><table><thead><tr><th>备份编号</th><th>创建时间</th><th>类型</th><th>大小</th><th>校验和</th><th>状态</th><th /></tr></thead><tbody>{backups.map((backup) => <tr key={backup.id}><td className="mono-cell">{backup.id}</td><td>{backup.createdAt}</td><td>{backup.type === 'full' ? '全量' : '逻辑备份'}</td><td>{backup.size}</td><td className="mono-cell">{backup.checksum}</td><td><StatusBadge status={backup.status} /></td><td><button className="secondary-button small-button" disabled={!apiConnected || backup.status !== 'verified'} onClick={() => setRestore(backup)}><ArchiveRestore size={15} />恢复</button></td></tr>)}</tbody></table></div>{backups.length === 0 && <div className="empty-state">暂无备份记录</div>}</section>
+  return <div className="page-stack"><section className="backup-summary"><div><ShieldCheck size={21} /><span>备份策略</span><strong>{apiConnected ? '正常' : '状态未知'}</strong><small>每次恢复前自动再备份</small></div><div><DatabaseBackup size={21} /><span>最近备份</span><strong>{backups.length ? backups[0].createdAt : '暂无'}</strong><small>{apiConnected ? '后端清单已连接' : '仅显示最后快照'}</small></div><div><ArchiveRestore size={21} /><span>恢复模式</span><strong>受控合并</strong><small>修改当前库并强制暂停自动化</small></div></section>{notice && <div className="toast-inline" role="status"><Check size={16} />{notice}<button title="关闭" aria-label="关闭" onClick={() => setNotice('')}><X size={15} /></button></div>}{error && <div className="error-inline" role="alert"><CircleAlert size={16} />{error}<button title="取消本次操作" aria-label="取消本次操作" onClick={() => { createAttempt.current = null; setError('') }}><X size={15} /></button></div>}<section className="panel data-panel"><div className="panel-header toolbar-heading"><div><h2>备份记录</h2><p>恢复会修改当前库；机器人保持暂停，旧发送任务不会自动重放</p></div><button className="primary-button" disabled={!apiConnected || busy} onClick={() => void createBackup()}><DatabaseBackup size={16} />{busy ? '处理中' : '立即备份'}</button></div><div className="table-wrap"><table><thead><tr><th>备份编号</th><th>创建时间</th><th>类型</th><th>大小</th><th>校验和</th><th>状态</th><th /></tr></thead><tbody>{backups.map((backup) => <tr key={backup.id}><td className="mono-cell">{backup.id}</td><td>{backup.createdAt}</td><td>{backup.type === 'full' ? '全量' : '逻辑备份'}</td><td>{backup.size}</td><td className="mono-cell">{backup.checksum}</td><td><StatusBadge status={backup.status} /></td><td><button className="secondary-button small-button" disabled={!apiConnected || backup.status !== 'verified'} onClick={() => setRestore(backup)}><ArchiveRestore size={15} />恢复</button></td></tr>)}</tbody></table></div>{backups.length === 0 && <div className="empty-state">暂无备份记录</div>}</section>
     {restore && <Modal title="执行受控合并恢复" onClose={closeRestore}><div className="modal-body"><div className="danger-notice"><CircleAlert size={19} /><div><strong>此操作会直接修改当前数据库</strong><span>系统先自动创建恢复前备份，再覆盖联系人、群和备注规则配置；权益、兑换和流水仅补缺，不会用旧快照覆盖现有事实。恢复后自动化保持暂停。</span></div></div><dl className="restore-details"><div><dt>备份编号</dt><dd>{restore.id}</dd></div><div><dt>创建时间</dt><dd>{restore.createdAt}</dd></div><div><dt>完整性</dt><dd>校验通过</dd></div></dl><label className="field"><span>输入 RESTORE 确认</span><input aria-label="输入 RESTORE 确认" value={confirm} onChange={(event) => setConfirm(event.target.value)} autoComplete="off" /></label></div><footer className="modal-footer"><button className="secondary-button" onClick={closeRestore}>取消</button><button className="danger-button" disabled={!apiConnected || confirm !== 'RESTORE' || busy} onClick={() => void performRestore()}><ArchiveRestore size={16} />{busy ? '处理中' : '确认恢复当前库'}</button></footer></Modal>}
   </div>
 }
@@ -710,12 +738,14 @@ function App() {
   ) => {
     await runMutation(() => activateTarget(input, operationKey))
   }
-  const handleCreateBackup = async () => { await runMutation(() => createLogicalBackup('管理台手工备份')) }
+  const handleCreateBackup = async (operationKey: string) => {
+    await runMutation(() => createLogicalBackup('管理台手工备份', operationKey))
+  }
   const handleRestore = async (id: string, operationKey: string) => {
     await runMutation(() => createControlledMergeRestore(id, operationKey))
   }
-  const handleQueueRemark = async (ruleId: string, targetId: string) => {
-    return runMutation(() => queueRemarkTask(ruleId, targetId))
+  const handleQueueRemark = async (ruleId: string, targetId: string, operationKey: string) => {
+    return runMutation(() => queueRemarkTask(ruleId, targetId, operationKey))
   }
   const handleAutomationChange = async (paused: boolean, reason: string) => {
     if (!apiConnected || !systemState) throw new Error('控制面状态尚未加载或连接已中断')

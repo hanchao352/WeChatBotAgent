@@ -10,6 +10,7 @@
 *.tsbuildinfo
 
 # Local runtime data and secrets
+/runtime/
 /src/backend/WeChatBot.Backend/runtime/
 **/state/
 **/backups/

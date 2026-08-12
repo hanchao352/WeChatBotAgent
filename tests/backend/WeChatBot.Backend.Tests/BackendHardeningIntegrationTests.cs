@@ -219,6 +219,55 @@ public sealed class BackendHardeningIntegrationTests
     }
 
     [Fact]
+    public async Task Audit_read_checks_records_hidden_by_filter_and_page_size()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAuthenticatedClient();
+        _ = await CreateGroupAsync(client);
+        _ = await CreateGroupAsync(client);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var oldest = await db.AuditLogs.IgnoreQueryFilters().AsNoTracking()
+                .OrderBy(x => x.CreatedAt)
+                .ThenBy(x => x.Id)
+                .FirstAsync();
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"UPDATE AuditLogs SET Actor = {"hidden-forged-actor"} WHERE Id = {oldest.Id}");
+        }
+
+        using var response = await client.GetAsync("/api/audit-logs?action=group.created&take=1");
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("audit_integrity_failed", await response.Content.ReadAsStringAsync(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Manual_backup_creation_is_idempotent_and_rejects_key_reuse()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAuthenticatedClient();
+        var key = $"backup-create-{Guid.NewGuid():N}";
+
+        var first = await SendCreateBackupAsync(client, "idempotent backup", key);
+        var replay = await SendCreateBackupAsync(client, "idempotent backup", key);
+        using var conflict = await SendCreateBackupResponseAsync(client, "different backup", key);
+
+        Assert.Equal(first.Id, replay.Id);
+        Assert.Equal(HttpStatusCode.Conflict, conflict.StatusCode);
+        Assert.Contains("idempotency_key_reused", await conflict.Content.ReadAsStringAsync(), StringComparison.OrdinalIgnoreCase);
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.Equal(1, await db.BackupManifests.IgnoreQueryFilters().CountAsync());
+        Assert.Equal(1, await db.IdempotencyRecords.IgnoreQueryFilters()
+            .CountAsync(x => x.Operation == "backup.create"));
+        Assert.Equal(1, await db.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(x => x.Action == "backup.created"));
+        Assert.Single(Directory.GetFiles(factory.BackupDirectory, "*.wxbak"));
+    }
+
+    [Fact]
     public async Task Audit_integrity_covers_the_captured_ip_address()
     {
         using var factory = new TestApplicationFactory();
@@ -388,18 +437,234 @@ public sealed class BackendHardeningIntegrationTests
     }
 
     [Fact]
+    public async Task V3_backups_reject_swapped_manifest_metadata_when_payload_ids_remain_original()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAuthenticatedClient();
+        var firstBackup = await CreateBackupAsync(client, "first manifest binding regression");
+        var secondBackup = await CreateBackupAsync(client, "second manifest binding regression");
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var first = await db.BackupManifests.IgnoreQueryFilters().SingleAsync(x => x.Id == firstBackup.Id);
+            var second = await db.BackupManifests.IgnoreQueryFilters().SingleAsync(x => x.Id == secondBackup.Id);
+            Assert.Equal(3, first.SchemaVersion);
+            Assert.Equal(3, second.SchemaVersion);
+
+            var firstFileName = first.FileName;
+            var firstPayloadSha256 = first.PayloadSha256;
+            var firstBytes = first.Bytes;
+            var firstSchemaVersion = first.SchemaVersion;
+            var firstCountsJson = first.CountsJson;
+            first.FileName = second.FileName;
+            first.PayloadSha256 = second.PayloadSha256;
+            first.Bytes = second.Bytes;
+            first.SchemaVersion = second.SchemaVersion;
+            first.CountsJson = second.CountsJson;
+            second.FileName = firstFileName;
+            second.PayloadSha256 = firstPayloadSha256;
+            second.Bytes = firstBytes;
+            second.SchemaVersion = firstSchemaVersion;
+            second.CountsJson = firstCountsJson;
+            await db.SaveChangesAsync();
+        }
+
+        foreach (var backupId in new[] { firstBackup.Id, secondBackup.Id })
+        {
+            using var verifyResponse = await client.PostAsync($"/api/backups/{backupId:D}/verify", null);
+            Assert.Equal(HttpStatusCode.OK, verifyResponse.StatusCode);
+            var verification = await verifyResponse.Content.ReadFromJsonAsync<BackupVerification>(JsonOptions);
+            Assert.False(verification!.IsValid);
+        }
+
+        foreach (var backupId in new[] { firstBackup.Id, secondBackup.Id })
+        {
+            await AssertRestoreRejectedWithoutSideEffectsAsync(
+                factory,
+                client,
+                backupId,
+                "backup_schema_mismatch");
+        }
+    }
+
+    [Fact]
+    public async Task Restore_restores_a_custom_service_package_definition_changed_after_backup()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAuthenticatedClient();
+        var packageId = Guid.NewGuid();
+        var original = new ServicePackage
+        {
+            Id = packageId,
+            Code = "CUSTOM_V3_BACKUP",
+            Name = "Custom v3 package",
+            Tier = PackageTier.Basic,
+            FeaturesJson = "[\"custom-one\",\"custom-two\"]",
+            IsEnabled = true,
+            Version = 3
+        };
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.ServicePackages.Add(original);
+            await db.SaveChangesAsync();
+        }
+
+        var backup = await CreateBackupAsync(client, "custom package restore regression");
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var changed = await db.ServicePackages.SingleAsync(x => x.Id == packageId);
+            changed.Code = "CUSTOM_V3_CHANGED";
+            changed.Name = "Changed package";
+            changed.Tier = PackageTier.AdvancedGeneral;
+            changed.FeaturesJson = "[\"changed\"]";
+            changed.IsEnabled = false;
+            changed.Version++;
+            await db.SaveChangesAsync();
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"/api/backups/{backup.Id:D}/restore")
+        {
+            Content = JsonContent.Create(new RestoreBackupRequest("RESTORE"), options: JsonOptions)
+        };
+        request.Headers.Add("Idempotency-Key", $"custom-package-{Guid.NewGuid():N}");
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.True(response.IsSuccessStatusCode, body);
+
+        using var verificationScope = factory.Services.CreateScope();
+        var verificationDb = verificationScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var restored = await verificationDb.ServicePackages.AsNoTracking().SingleAsync(x => x.Id == packageId);
+        Assert.Equal(original.Code, restored.Code);
+        Assert.Equal(original.Name, restored.Name);
+        Assert.Equal(original.Tier, restored.Tier);
+        Assert.Equal(original.FeaturesJson, restored.FeaturesJson);
+        Assert.Equal(original.IsEnabled, restored.IsEnabled);
+    }
+
+    [Theory]
+    [InlineData("duplicate-id")]
+    [InlineData("duplicate-code")]
+    [InlineData("malformed-features")]
+    [InlineData("invalid-tier")]
+    public async Task Verify_and_restore_fail_closed_for_invalid_service_package_payloads(string corruption)
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAuthenticatedClient();
+        var backup = await CreateBackupAsync(client, $"invalid package {corruption}");
+        await RewriteServicePackagesAsync(factory, backup.Id, packages =>
+        {
+            var package = packages.First(x => x.Id == WellKnownPackages.BasicId);
+            switch (corruption)
+            {
+                case "duplicate-id":
+                    packages.Add(ClonePackage(package, package.Id, "BASIC_DUPLICATE_ID"));
+                    break;
+                case "duplicate-code":
+                    packages.Add(ClonePackage(package, Guid.NewGuid(), package.Code.ToLowerInvariant()));
+                    break;
+                case "malformed-features":
+                    package.FeaturesJson = "{not-json";
+                    break;
+                case "invalid-tier":
+                    package.Tier = (PackageTier)999;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(corruption), corruption, null);
+            }
+            return packages;
+        });
+
+        using (var verifyResponse = await client.PostAsync($"/api/backups/{backup.Id:D}/verify", null))
+        {
+            Assert.Equal(HttpStatusCode.OK, verifyResponse.StatusCode);
+            var verification = await verifyResponse.Content.ReadFromJsonAsync<BackupVerification>(JsonOptions);
+            Assert.False(verification!.IsValid);
+        }
+
+        await AssertRestoreRejectedWithoutSideEffectsAsync(
+            factory,
+            client,
+            backup.Id,
+            "backup_package_reference_invalid");
+    }
+
+    [Fact]
+    public async Task Restore_rejects_a_database_package_with_the_backup_code_and_a_different_id()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAuthenticatedClient();
+        var backedUpPackageId = Guid.NewGuid();
+        const string packageCode = "CUSTOM_CODE_CONFLICT";
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.ServicePackages.Add(new ServicePackage
+            {
+                Id = backedUpPackageId,
+                Code = packageCode,
+                Name = "Backed up owner",
+                Tier = PackageTier.Basic,
+                FeaturesJson = "[\"custom\"]",
+                IsEnabled = true
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var backup = await CreateBackupAsync(client, "database package code conflict");
+        var conflictingPackageId = Guid.NewGuid();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var originalOwner = await db.ServicePackages.SingleAsync(x => x.Id == backedUpPackageId);
+            originalOwner.Code = "CUSTOM_CODE_MOVED";
+            originalOwner.Version++;
+            await db.SaveChangesAsync();
+
+            db.ServicePackages.Add(new ServicePackage
+            {
+                Id = conflictingPackageId,
+                Code = packageCode,
+                Name = "Current owner",
+                Tier = PackageTier.Basic,
+                FeaturesJson = "[\"current\"]",
+                IsEnabled = true
+            });
+            await db.SaveChangesAsync();
+        }
+
+        using (var verifyResponse = await client.PostAsync($"/api/backups/{backup.Id:D}/verify", null))
+        {
+            Assert.Equal(HttpStatusCode.OK, verifyResponse.StatusCode);
+            var verification = await verifyResponse.Content.ReadFromJsonAsync<BackupVerification>(JsonOptions);
+            Assert.False(verification!.IsValid);
+        }
+
+        await AssertRestoreRejectedWithoutSideEffectsAsync(
+            factory,
+            client,
+            backup.Id,
+            "backup_package_reference_invalid");
+
+        using var verificationScope = factory.Services.CreateScope();
+        var verificationDb = verificationScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.Equal(
+            "CUSTOM_CODE_MOVED",
+            await verificationDb.ServicePackages.Where(x => x.Id == backedUpPackageId).Select(x => x.Code).SingleAsync());
+        Assert.Equal(
+            packageCode,
+            await verificationDb.ServicePackages.Where(x => x.Id == conflictingPackageId).Select(x => x.Code).SingleAsync());
+    }
+
+    [Fact]
     public async Task Restore_rejects_a_backup_containing_a_tampered_audit_record()
     {
         using var factory = new TestApplicationFactory();
         using var client = factory.CreateAuthenticatedClient();
         _ = await CreateGroupAsync(client);
-        var backupResponse = await client.PostAsJsonAsync(
-            "/api/backups",
-            new CreateBackupRequest("audit integrity regression"),
-            JsonOptions);
-        var backupBody = await backupResponse.Content.ReadAsStringAsync();
-        Assert.True(backupResponse.IsSuccessStatusCode, backupBody);
-        var backup = JsonSerializer.Deserialize<BackupItem>(backupBody, JsonOptions)!;
+        var backup = await CreateBackupAsync(client, "audit integrity regression");
 
         using (var scope = factory.Services.CreateScope())
         {
@@ -1003,6 +1268,69 @@ public sealed class BackendHardeningIntegrationTests
         Assert.Contains("cannot contain '|'", exception.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    [InlineData("Auth:TenantId", "11111111-1111-1111-1111-111111111111", "development tenant")]
+    [InlineData("Auth:ActorName", "local-admin", "development tenant")]
+    [InlineData("Auth:AgentActorName", "local-agent", "development tenant")]
+    [InlineData("ConnectionStrings:Database", "Data Source=relative.db", "absolute SQLite")]
+    [InlineData("Backup:Directory", "relative-backups", "absolute path")]
+    [InlineData("Auth:AllowAgentAutoRegistration", "true", "explicitly set to false")]
+    public async Task Production_rejects_unsafe_operational_defaults(
+        string key,
+        string value,
+        string expectedMessage)
+    {
+        using var factory = new ProductionApplicationFactory(new Dictionary<string, string?>
+        {
+            [key] = value
+        });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            using var client = factory.CreateClient();
+            _ = await client.GetAsync("/health/live");
+        });
+        Assert.Contains(expectedMessage, exception.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("Auth:ApiKey", "wechatbot-local-development-key-change-me")]
+    [InlineData("Auth:AgentApiKey", "wechatbot-local-agent-development-key-change-me")]
+    [InlineData("Activation:HashPepper", "local-activation-pepper-change-before-production-2026")]
+    [InlineData("Audit:IntegrityKey", "local-audit-integrity-key-change-before-production-2026")]
+    public async Task Production_rejects_public_development_secrets(string key, string value)
+    {
+        using var factory = new ProductionApplicationFactory(new Dictionary<string, string?>
+        {
+            [key] = value
+        });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            using var client = factory.CreateClient();
+            _ = await client.GetAsync("/health/live");
+        });
+        Assert.Contains("public development credential", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Production_rejects_the_public_development_backup_key()
+    {
+        var developmentKey = Convert.ToBase64String(
+            SHA256.HashData("local-backup-key-change-before-production"u8.ToArray()));
+        using var factory = new ProductionApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Backup:EncryptionKeyBase64"] = developmentKey
+        });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            using var client = factory.CreateClient();
+            _ = await client.GetAsync("/health/live");
+        });
+        Assert.Contains("public development credential", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
     private static async Task<HttpResponseMessage> PostWhitespaceMentionAsync(HttpClient client)
     {
         var group = await CreateGroupAsync(client);
@@ -1072,10 +1400,31 @@ public sealed class BackendHardeningIntegrationTests
 
     private static async Task<BackupItem> CreateBackupAsync(HttpClient client, string reason)
     {
-        var response = await client.PostAsJsonAsync("/api/backups", new CreateBackupRequest(reason), JsonOptions);
+        return await SendCreateBackupAsync(client, reason, $"backup-{Guid.NewGuid():N}");
+    }
+
+    private static async Task<BackupItem> SendCreateBackupAsync(
+        HttpClient client,
+        string reason,
+        string idempotencyKey)
+    {
+        using var response = await SendCreateBackupResponseAsync(client, reason, idempotencyKey);
         var body = await response.Content.ReadAsStringAsync();
         Assert.True(response.IsSuccessStatusCode, body);
         return JsonSerializer.Deserialize<BackupItem>(body, JsonOptions)!;
+    }
+
+    private static Task<HttpResponseMessage> SendCreateBackupResponseAsync(
+        HttpClient client,
+        string reason,
+        string idempotencyKey)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/api/backups")
+        {
+            Content = JsonContent.Create(new CreateBackupRequest(reason), options: JsonOptions)
+        };
+        request.Headers.Add("Idempotency-Key", idempotencyKey);
+        return client.SendAsync(request);
     }
 
     private static async Task RewriteBackupAsync(
@@ -1102,6 +1451,79 @@ public sealed class BackendHardeningIntegrationTests
         await File.WriteAllBytesAsync(path, encrypted);
         manifest.PayloadSha256 = StableHash.Sha256(encrypted);
         await db.SaveChangesAsync();
+    }
+
+    private static async Task RewriteServicePackagesAsync(
+        TestApplicationFactory factory,
+        Guid backupId,
+        Func<List<ServicePackage>, List<ServicePackage>> rewrite)
+    {
+        var packageCount = 0;
+        await RewriteBackupAsync(factory, backupId, (root, writer) =>
+        {
+            foreach (var property in root.EnumerateObject())
+            {
+                writer.WritePropertyName(property.Name);
+                if (property.NameEquals("servicePackages"))
+                {
+                    var packages = JsonSerializer.Deserialize<List<ServicePackage>>(
+                        property.Value.GetRawText(),
+                        JsonOptions)!;
+                    packages = rewrite(packages);
+                    packageCount = packages.Count;
+                    JsonSerializer.Serialize(writer, packages, JsonOptions);
+                }
+                else
+                {
+                    property.Value.WriteTo(writer);
+                }
+            }
+        });
+        await UpdateManifestCountsAsync(factory, backupId, "servicePackages", packageCount);
+    }
+
+    private static ServicePackage ClonePackage(ServicePackage source, Guid id, string code) => new()
+    {
+        Id = id,
+        Code = code,
+        Name = source.Name,
+        Tier = source.Tier,
+        FeaturesJson = source.FeaturesJson,
+        IsEnabled = source.IsEnabled,
+        Version = source.Version
+    };
+
+    private static async Task AssertRestoreRejectedWithoutSideEffectsAsync(
+        TestApplicationFactory factory,
+        HttpClient client,
+        Guid backupId,
+        string expectedErrorCode)
+    {
+        int backupCountBefore;
+        int restoreCountBefore;
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            backupCountBefore = await db.BackupManifests.IgnoreQueryFilters().CountAsync();
+            restoreCountBefore = await db.RestoreOperations.IgnoreQueryFilters().CountAsync();
+            Assert.False(await db.Tenants.IgnoreQueryFilters().Select(x => x.AutomationPaused).SingleAsync());
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"/api/backups/{backupId:D}/restore")
+        {
+            Content = JsonContent.Create(new RestoreBackupRequest("RESTORE"), options: JsonOptions)
+        };
+        request.Headers.Add("Idempotency-Key", $"rejected-restore-{Guid.NewGuid():N}");
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains(expectedErrorCode, body, StringComparison.OrdinalIgnoreCase);
+
+        using var verificationScope = factory.Services.CreateScope();
+        var verificationDb = verificationScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.False(await verificationDb.Tenants.IgnoreQueryFilters().Select(x => x.AutomationPaused).SingleAsync());
+        Assert.Equal(backupCountBefore, await verificationDb.BackupManifests.IgnoreQueryFilters().CountAsync());
+        Assert.Equal(restoreCountBefore, await verificationDb.RestoreOperations.IgnoreQueryFilters().CountAsync());
     }
 
     private static async Task UpdateManifestCountsAsync(
@@ -1238,6 +1660,7 @@ public sealed class BackendHardeningIntegrationTests
                 ["Auth:TenantId"] = Guid.NewGuid().ToString("D"),
                 ["Auth:ActorName"] = "production-admin",
                 ["Auth:AgentActorName"] = "production-agent",
+                ["Auth:AllowAgentAutoRegistration"] = "false",
                 ["Activation:HashPepper"] = "production-activation-pepper-with-more-than-thirty-two-characters",
                 ["Audit:IntegrityKey"] = "production-audit-integrity-key-with-more-than-thirty-two-characters",
                 ["Backup:Directory"] = Path.Combine(_root, "backups"),
@@ -1253,6 +1676,9 @@ public sealed class BackendHardeningIntegrationTests
             builder.UseSetting("Auth:TenantId", values["Auth:TenantId"]);
             builder.UseSetting("Auth:ActorName", values["Auth:ActorName"]);
             builder.UseSetting("Auth:AgentActorName", values["Auth:AgentActorName"]);
+            builder.UseSetting(
+                "Auth:AllowAgentAutoRegistration",
+                values["Auth:AllowAgentAutoRegistration"]);
             builder.UseSetting("Activation:HashPepper", values["Activation:HashPepper"]);
             builder.UseSetting("Audit:IntegrityKey", values["Audit:IntegrityKey"]);
             builder.UseSetting("Backup:Directory", values["Backup:Directory"]);

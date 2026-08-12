@@ -125,6 +125,11 @@ public sealed record AgentHeartbeatRequest(
     bool DryRun,
     [param: Required, StringLength(64, MinimumLength = 1), NonWhiteSpace] string AgentVersion);
 
+public sealed record RegisterAgentRequest(
+    [param: Required, StringLength(128, MinimumLength = 1), NonWhiteSpace] string AgentId,
+    [param: Required, StringLength(128, MinimumLength = 1), NonWhiteSpace] string WeChatInstanceId,
+    [param: Required, StringLength(64, MinimumLength = 1), NonWhiteSpace] string ConfigurationVersion);
+
 [AttributeUsage(AttributeTargets.Property | AttributeTargets.Parameter)]
 public sealed class NonWhiteSpaceAttribute : ValidationAttribute
 {
