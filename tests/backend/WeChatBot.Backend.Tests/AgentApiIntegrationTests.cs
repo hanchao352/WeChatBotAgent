@@ -42,6 +42,155 @@ public sealed class AgentApiIntegrationTests
     }
 
     [Fact]
+    public async Task Agent_message_upload_requires_matching_recent_healthy_dry_run_binding()
+    {
+        using var factory = new TestApplicationFactory();
+        using var agent = factory.CreateAgentClient();
+        using var admin = factory.CreateAuthenticatedClient();
+        var agentId = $"uploader-{Guid.NewGuid():N}";
+        var instanceId = $"wx-{Guid.NewGuid():N}";
+        var group = await CreateGroupAsync(admin);
+        var mention = new GroupMentionRequest(
+            $"event-{Guid.NewGuid():N}",
+            group.Id,
+            "sender-1",
+            "ordinary group message",
+            false,
+            false,
+            DateTimeOffset.UtcNow);
+
+        using var beforeHeartbeat = await agent.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest(instanceId, mention),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Conflict, beforeHeartbeat.StatusCode);
+
+        var heartbeat = await PostHeartbeatAsync(
+            agent,
+            CreateHeartbeat(agentId, instanceId, DateTimeOffset.UtcNow, dryRun: true));
+        Assert.True(heartbeat.Accepted);
+
+        using var wrongBinding = await agent.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest("wx-wrong", mention),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Conflict, wrongBinding.StatusCode);
+
+        using var uploaded = await agent.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest(instanceId, mention),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Created, uploaded.StatusCode);
+        var uploadedBody = await uploaded.Content.ReadAsStringAsync();
+        Assert.Contains("ignoredNotMentioned", uploadedBody, StringComparison.Ordinal);
+
+        using var list = await agent.GetAsync("/api/group-mentions");
+        Assert.Equal(HttpStatusCode.Forbidden, list.StatusCode);
+        using var adminRoute = await agent.PostAsJsonAsync("/api/group-mentions", mention, JsonOptions);
+        Assert.Equal(HttpStatusCode.Forbidden, adminRoute.StatusCode);
+        using var remarkTasks = await agent.GetAsync("/api/remark-tasks");
+        Assert.Equal(HttpStatusCode.Forbidden, remarkTasks.StatusCode);
+        using var agentRouteAsAdmin = await admin.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest(instanceId, mention),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Forbidden, agentRouteAsAdmin.StatusCode);
+    }
+
+    [Fact]
+    public async Task Non_dry_run_heartbeat_is_never_accepted_for_agent_operations()
+    {
+        using var factory = new TestApplicationFactory();
+        using var agent = factory.CreateAgentClient();
+        using var admin = factory.CreateAuthenticatedClient();
+        var agentId = $"live-{Guid.NewGuid():N}";
+        var instanceId = $"wx-{Guid.NewGuid():N}";
+        var heartbeat = await PostHeartbeatAsync(
+            agent,
+            CreateHeartbeat(agentId, instanceId, DateTimeOffset.UtcNow, dryRun: false));
+
+        Assert.False(heartbeat.Accepted);
+
+        var group = await CreateGroupAsync(admin);
+        var mention = new GroupMentionRequest(
+            $"event-{Guid.NewGuid():N}",
+            group.Id,
+            "sender-live",
+            "ordinary group message",
+            false,
+            false,
+            DateTimeOffset.UtcNow);
+        using var upload = await agent.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest(instanceId, mention),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Conflict, upload.StatusCode);
+    }
+
+    [Fact]
+    public async Task Agent_message_upload_is_rejected_while_emergency_stop_is_active()
+    {
+        using var factory = new TestApplicationFactory();
+        using var agent = factory.CreateAgentClient();
+        using var admin = factory.CreateAuthenticatedClient();
+        var agentId = $"paused-uploader-{Guid.NewGuid():N}";
+        var instanceId = $"wx-{Guid.NewGuid():N}";
+        Assert.True((await PostHeartbeatAsync(
+            agent,
+            CreateHeartbeat(agentId, instanceId, DateTimeOffset.UtcNow, dryRun: true))).Accepted);
+
+        var state = await admin.GetFromJsonAsync<SystemState>("/api/system-state", JsonOptions);
+        using var pause = await admin.PutAsJsonAsync(
+            "/api/system-state/automation",
+            new AutomationStateRequest(state!.Version, true, "agent upload emergency stop"),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.OK, pause.StatusCode);
+
+        var group = await CreateGroupAsync(admin);
+        var mention = new GroupMentionRequest(
+            $"event-{Guid.NewGuid():N}",
+            group.Id,
+            "sender-paused",
+            "ordinary group message",
+            false,
+            false,
+            DateTimeOffset.UtcNow);
+        using var upload = await agent.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest(instanceId, mention),
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Conflict, upload.StatusCode);
+        Assert.Contains("automation_paused", await upload.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+
+        var pausedState = await admin.GetFromJsonAsync<SystemState>("/api/system-state", JsonOptions);
+        using var resume = await admin.PutAsJsonAsync(
+            "/api/system-state/automation",
+            new AutomationStateRequest(pausedState!.Version, false, "resume agent uploads"),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.OK, resume.StatusCode);
+
+        using var staleLeaseUpload = await agent.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest(instanceId, mention),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Conflict, staleLeaseUpload.StatusCode);
+        Assert.Contains(
+            "agent_lease_unavailable",
+            await staleLeaseUpload.Content.ReadAsStringAsync(),
+            StringComparison.Ordinal);
+
+        Assert.True((await PostHeartbeatAsync(
+            agent,
+            CreateHeartbeat(agentId, instanceId, DateTimeOffset.UtcNow, dryRun: true))).Accepted);
+        using var refreshedLeaseUpload = await agent.PostAsJsonAsync(
+            $"/api/agents/{agentId}/group-mentions",
+            new AgentGroupMentionRequest(instanceId, mention),
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Created, refreshedLeaseUpload.StatusCode);
+    }
+
+    [Fact]
     public async Task Heartbeat_registers_updates_and_rejects_another_wechat_binding()
     {
         using var factory = new TestApplicationFactory();
@@ -140,6 +289,23 @@ public sealed class AgentApiIntegrationTests
     }
 
     [Fact]
+    public async Task Heartbeat_older_than_the_online_lease_window_is_rejected()
+    {
+        using var factory = new TestApplicationFactory();
+        using var client = factory.CreateAgentClient();
+
+        using var response = await PostHeartbeatResponseAsync(
+            client,
+            CreateHeartbeat(
+                $"stale-{Guid.NewGuid():N}",
+                "wx-stale",
+                DateTimeOffset.UtcNow.AddMinutes(-3)));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("stale_heartbeat", await response.Content.ReadAsStringAsync(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Restore_preserves_newer_telemetry_and_never_restores_stale_online_state()
     {
         using var factory = new TestApplicationFactory();
@@ -194,7 +360,8 @@ public sealed class AgentApiIntegrationTests
         string agentId,
         string weChatInstanceId,
         DateTimeOffset sentAt,
-        int queueDepth = 0) =>
+        int queueDepth = 0,
+        bool dryRun = true) =>
         new(
             agentId,
             weChatInstanceId,
@@ -208,8 +375,25 @@ public sealed class AgentApiIntegrationTests
                 null),
             queueDepth,
             0,
-            false,
+            dryRun,
             "1.0.0-test");
+
+    private static async Task<GroupItem> CreateGroupAsync(HttpClient client)
+    {
+        using var response = await client.PostAsJsonAsync(
+            "/api/groups",
+            new GroupCreateRequest(
+                $"agent-upload-group-{Guid.NewGuid():N}",
+                "Agent upload group",
+                null,
+                null,
+                false,
+                null),
+            JsonOptions);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.True(response.IsSuccessStatusCode, body);
+        return JsonSerializer.Deserialize<GroupItem>(body, JsonOptions)!;
+    }
 
     private static async Task<AgentHeartbeatResponse> PostHeartbeatAsync(
         HttpClient client,
@@ -228,4 +412,5 @@ public sealed class AgentApiIntegrationTests
 
     private sealed record BackupItem(Guid Id);
     private sealed record SystemState(bool AutomationPaused, long Version);
+    private sealed record GroupItem(Guid Id);
 }

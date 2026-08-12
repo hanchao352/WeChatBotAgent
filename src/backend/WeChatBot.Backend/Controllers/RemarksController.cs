@@ -242,6 +242,22 @@ public sealed class RemarkTasksController(
         var now = timeProvider.GetUtcNow();
         if (request.Succeeded)
         {
+            var automationPaused = await db.Tenants.AsNoTracking()
+                .Select(x => x.AutomationPaused)
+                .SingleAsync(cancellationToken);
+            if (automationPaused)
+            {
+                audit.Add(
+                    "remark-task.completion-rejected.automation-paused",
+                    nameof(RemarkTask),
+                    task.Id.ToString("D"),
+                    false,
+                    new { task.TargetKind, task.TargetId });
+                await db.SaveChangesAsync(cancellationToken);
+                throw DomainException.Conflict(
+                    "automation_paused",
+                    "Automation is paused; successful remark completion cannot be accepted.");
+            }
             await EnsureAutoRemarkEntitledAsync(
                 task.TargetKind,
                 task.TargetId,
@@ -376,9 +392,10 @@ public sealed class RemarkTasksController(
 
     private static string ValidateIdempotencyKey(string? value)
     {
-        if (string.IsNullOrWhiteSpace(value) || value.Length > 128)
+        var normalized = value?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized) || normalized.Length > 128)
             throw DomainException.Validation("invalid_idempotency_key", "Idempotency-Key is required and must be at most 128 characters.");
-        return value.Trim();
+        return normalized;
     }
 
     private static RemarkTask ValidateReplay(RemarkTask task, string requestHash)

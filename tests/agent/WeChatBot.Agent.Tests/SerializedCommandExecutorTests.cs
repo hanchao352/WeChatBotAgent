@@ -206,6 +206,68 @@ public sealed class SerializedCommandExecutorTests
     }
 
     [Fact]
+    public async Task EnqueueAfterStopIsRejectedWithoutChangingQueueDepth()
+    {
+        await using var executor = new SerializedCommandExecutor(
+            [new TrackingHandler(TimeSpan.Zero)],
+            new InMemoryIdempotencyStore(),
+            HealthyRuntime(),
+            "wechat-test");
+        executor.Start();
+        await executor.StopAsync();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => executor.EnqueueAsync(CreateCommand(1)).AsTask());
+
+        Assert.Contains("no longer accepts", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, executor.QueueDepth);
+    }
+
+    [Fact]
+    public async Task StopCompletesQueuedCommandsWithoutExecutingThem()
+    {
+        var handler = new BlockingHandler();
+        var executor = new SerializedCommandExecutor(
+            [handler],
+            new InMemoryIdempotencyStore(),
+            HealthyRuntime(),
+            "wechat-test",
+            capacity: 2);
+        executor.Start();
+        var active = executor.EnqueueAsync(CreateCommand(1)).AsTask();
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var queued = executor.EnqueueAsync(CreateCommand(2)).AsTask();
+        var stop = executor.StopAsync();
+
+        Assert.False(stop.IsCompleted);
+        Assert.False(queued.IsCompleted);
+
+        handler.Release.TrySetResult();
+        Assert.Equal(CommandResultStatus.DryRun, (await active).Status);
+        var queuedResult = await queued.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(CommandResultStatus.Paused, queuedResult.Status);
+        Assert.Equal("STOPPING", queuedResult.Code);
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(0, executor.QueueDepth);
+        await executor.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task StoppedExecutorCannotBeStarted()
+    {
+        await using var executor = new SerializedCommandExecutor(
+            [new TrackingHandler(TimeSpan.Zero)],
+            new InMemoryIdempotencyStore(),
+            HealthyRuntime(),
+            "wechat-test");
+        await executor.StopAsync();
+
+        var exception = Assert.Throws<InvalidOperationException>(executor.Start);
+
+        Assert.Contains("cannot be restarted", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task EmergencyPauseAfterPermitPreventsExternalActionBoundary()
     {
         var runtime = HealthyRuntime();

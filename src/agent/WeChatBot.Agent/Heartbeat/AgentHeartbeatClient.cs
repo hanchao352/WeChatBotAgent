@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Text.Json;
+using WeChatBot.Agent.Automation;
 using WeChatBot.Agent.Configuration;
 using WeChatBot.Agent.Runtime;
 
@@ -74,9 +75,12 @@ public sealed class AgentHeartbeatPump(
     bool dryRun,
     TimeSpan interval,
     int missedHeartbeatLimit,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    IAgentRecoverySelfCheck? recoverySelfCheck = null,
+    TimeSpan? recoverySelfCheckTimeout = null)
 {
     private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+    private readonly TimeSpan _recoverySelfCheckTimeout = recoverySelfCheckTimeout ?? TimeSpan.FromSeconds(5);
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -115,9 +119,16 @@ public sealed class AgentHeartbeatPump(
                 }
                 else
                 {
-                    runtimeState.ResumeAfterControlPlaneAccepted(
+                    runtimeState.ResumeAfterControlPlaneDecision(
+                        response.Accepted,
+                        response.EmergencyStop,
                         "The control plane accepted the current agent lease.",
                         _timeProvider.GetUtcNow());
+
+                    if (runtimeState.Snapshot().State == AgentOperatingState.PausedUnknownUi)
+                    {
+                        RunControlledRecoverySelfCheck(cancellationToken);
+                    }
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -150,6 +161,44 @@ public sealed class AgentHeartbeatPump(
             {
                 break;
             }
+        }
+    }
+
+    private void RunControlledRecoverySelfCheck(CancellationToken cancellationToken)
+    {
+        if (recoverySelfCheck is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var report = recoverySelfCheck.Run(_recoverySelfCheckTimeout, cancellationToken);
+            if (report.Ready)
+            {
+                runtimeState.ResumeAfterVerifiedSelfCheck(
+                    "The controlled environment and UI self-check passed.",
+                    _timeProvider.GetUtcNow());
+                return;
+            }
+
+            var failure = report.Findings.FirstOrDefault(finding =>
+                finding.Severity == SelfCheckSeverity.Critical && !finding.Passed);
+            runtimeState.PauseForUnknownUi(
+                failure?.Code ?? report.UiProbe.Code,
+                failure?.Summary ?? report.UiProbe.Summary,
+                _timeProvider.GetUtcNow());
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            runtimeState.PauseForUnknownUi(
+                "RECOVERY_SELF_CHECK_FAILED",
+                $"The controlled recovery self-check failed ({exception.GetType().Name}).",
+                _timeProvider.GetUtcNow());
         }
     }
 }

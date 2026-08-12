@@ -188,8 +188,22 @@ public sealed class EntitlementsController(
     AppDbContext db,
     TenantContext tenant,
     TimeProvider timeProvider,
+    ActivationService activationService,
     AuditService audit) : ControllerBase
 {
+    [HttpPost("activate")]
+    public async Task<ActionResult<RedemptionResult>> Activate(
+        ActivateServiceRequest request,
+        [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
+        CancellationToken cancellationToken) =>
+        Ok(await activationService.ActivateForTargetAsync(
+            request.PackageCode,
+            request.Duration,
+            request.TargetKind,
+            request.TargetId,
+            idempotencyKey ?? string.Empty,
+            cancellationToken));
+
     [HttpGet]
     public async Task<ActionResult<IReadOnlyList<EntitlementResponse>>> List(
         [FromQuery] ServiceTargetKind? targetKind,
@@ -200,14 +214,20 @@ public sealed class EntitlementsController(
         var query = db.Entitlements.AsNoTracking();
         if (targetKind is not null) query = query.Where(x => x.TargetKind == targetKind);
         if (targetId is not null) query = query.Where(x => x.TargetId == targetId);
+        var now = timeProvider.GetUtcNow();
+        if (activeOnly)
+        {
+            query = query.Where(x =>
+                x.State == EntitlementState.Active &&
+                x.StartsAt <= now &&
+                (x.EndsAt == null || x.EndsAt > now));
+        }
         var entities = await query.OrderByDescending(x => x.CreatedAt).Take(500).ToListAsync(cancellationToken);
         var packageIds = entities.Select(x => x.PackageId).Distinct().ToArray();
         var packages = await db.ServicePackages.AsNoTracking()
             .Where(x => packageIds.Contains(x.Id))
             .ToDictionaryAsync(x => x.Id, cancellationToken);
-        var now = timeProvider.GetUtcNow();
         var results = entities.Select(x => ToResponse(x, packages[x.PackageId], now));
-        if (activeOnly) results = results.Where(x => x.EffectiveStatus == "active");
         return Ok(results.ToList());
     }
 
@@ -232,6 +252,10 @@ public sealed class EntitlementsController(
                      ?? throw DomainException.NotFound("Entitlement");
         if (entity.Version != request.ExpectedVersion)
             throw DomainException.Conflict("concurrency_conflict", "The entitlement changed after it was read.");
+        if (!Enum.IsDefined(request.State))
+            throw DomainException.Validation("invalid_entitlement_state", "State must be a supported entitlement state.");
+        if (string.IsNullOrWhiteSpace(request.Reason) || request.Reason.Trim().Length < 3)
+            throw DomainException.Validation("state_reason_required", "A reason of at least three characters is required.");
         if (entity.State == EntitlementState.Revoked && request.State != EntitlementState.Revoked)
             throw DomainException.Conflict("revoked_entitlement_immutable", "A revoked entitlement cannot be reactivated.");
         if (entity.State == request.State)

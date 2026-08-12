@@ -114,6 +114,15 @@ public sealed class SafetyAndContractTests
     }
 
     [Fact]
+    public void ProcessDetectorIgnoresProcessesOutsideTheConfiguredWindowsSession()
+    {
+        var impossibleSessionId = int.MaxValue;
+        var detector = new WeChatProcessDetector(impossibleSessionId);
+
+        Assert.Empty(detector.DetectMainProcesses());
+    }
+
+    [Fact]
     public void VersionPrefixMatchesOnlyAtComponentBoundary()
     {
         var profile = UiCompatibilityProfile.StrictDefault(["4.0.5"], ["fingerprint-1", "fingerprint-2"]);
@@ -191,6 +200,65 @@ public sealed class SafetyAndContractTests
 
         Assert.Equal(AgentOperatingState.PausedOperator, runtime.Snapshot().State);
         Assert.Equal("OPERATOR_PAUSE", runtime.Snapshot().ReasonCode);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public void OperatorPauseCannotResumeWithoutAcceptedClearedControlPlaneDecision(
+        bool accepted,
+        bool emergencyStop)
+    {
+        var runtime = new AgentRuntimeState();
+        runtime.PauseByOperator("emergency stop", DateTimeOffset.UtcNow);
+
+        var resumed = runtime.ResumeAfterControlPlaneDecision(
+            accepted,
+            emergencyStop,
+            "control plane decision",
+            DateTimeOffset.UtcNow.AddSeconds(1));
+
+        Assert.False(resumed);
+        Assert.Equal(AgentOperatingState.PausedOperator, runtime.Snapshot().State);
+    }
+
+    [Fact]
+    public void AcceptedClearedControlPlaneDecisionResumesOperatorPause()
+    {
+        var runtime = new AgentRuntimeState();
+        runtime.PauseByOperator("emergency stop", DateTimeOffset.UtcNow);
+
+        var resumed = runtime.ResumeAfterControlPlaneDecision(
+            accepted: true,
+            emergencyStop: false,
+            "emergency stop cleared",
+            DateTimeOffset.UtcNow.AddSeconds(1));
+
+        Assert.True(resumed);
+        Assert.Equal(AgentOperatingState.Healthy, runtime.Snapshot().State);
+    }
+
+    [Fact]
+    public void EmergencyStopCannotEraseUnknownUiRecoveryRequirement()
+    {
+        var runtime = new AgentRuntimeState();
+        runtime.PauseForUnknownUi("UNKNOWN", "unknown surface", DateTimeOffset.UtcNow);
+        runtime.PauseByOperator("emergency stop", DateTimeOffset.UtcNow.AddSeconds(1));
+
+        var resumed = runtime.ResumeAfterControlPlaneDecision(
+            accepted: true,
+            emergencyStop: false,
+            "emergency stop cleared",
+            DateTimeOffset.UtcNow.AddSeconds(2));
+
+        Assert.False(resumed);
+        Assert.Equal(AgentOperatingState.PausedUnknownUi, runtime.Snapshot().State);
+        Assert.Equal("UNKNOWN_UI_RECHECK_REQUIRED", runtime.Snapshot().ReasonCode);
+        Assert.True(runtime.ResumeAfterVerifiedSelfCheck(
+            "controlled self-check passed",
+            DateTimeOffset.UtcNow.AddSeconds(3)));
+        Assert.Equal(AgentOperatingState.Healthy, runtime.Snapshot().State);
     }
 
     [Fact]

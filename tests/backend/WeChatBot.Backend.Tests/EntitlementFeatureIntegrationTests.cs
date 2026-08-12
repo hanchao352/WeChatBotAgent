@@ -222,7 +222,7 @@ public sealed class EntitlementFeatureIntegrationTests
         using var factory = new TestApplicationFactory();
         using var client = factory.CreateAuthenticatedClient();
         await AddPackageAsync(factory, "AUTO_ONLY", "[\"AUTO-REMARK\"]", PackageTier.Basic);
-        await AddPackageAsync(factory, "GROUP_UPPER", "[\"GROUP-MENTION\"]", PackageTier.AdvancedGeneral);
+        await AddPackageAsync(factory, "GROUP_UPPER", "[\"GROUP-MENTION\"]", PackageTier.Basic);
         var group = await CreateGroupAsync(client);
 
         await IssueAndRedeemAsync(
@@ -254,7 +254,7 @@ public sealed class EntitlementFeatureIntegrationTests
         using var factory = new TestApplicationFactory();
         using var client = factory.CreateAuthenticatedClient();
         await AddPackageAsync(factory, "GROUP_ONLY", "[\"group-mention\"]", PackageTier.Basic);
-        await AddPackageAsync(factory, "AUTO_UPPER", "[\"AUTO-REMARK\"]", PackageTier.AdvancedGeneral);
+        await AddPackageAsync(factory, "AUTO_UPPER", "[\"AUTO-REMARK\"]", PackageTier.Basic);
         var contact = await CreateContactAsync(client);
         var rule = await CreateRemarkRuleAsync(client);
 

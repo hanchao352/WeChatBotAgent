@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using WeChatBot.Backend.Domain;
 using WeChatBot.Backend.Infrastructure;
+using WeChatBot.Backend.Services;
 
 namespace WeChatBot.Backend.Data;
 
@@ -21,10 +22,12 @@ public static class DbInitializer
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auth = scope.ServiceProvider.GetRequiredService<IOptions<AuthOptions>>().Value;
         var clock = scope.ServiceProvider.GetRequiredService<TimeProvider>();
+        var audit = scope.ServiceProvider.GetRequiredService<AuditService>();
 
         await db.Database.MigrateAsync(cancellationToken);
         await db.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;", cancellationToken);
         await db.Database.ExecuteSqlRawAsync("PRAGMA busy_timeout=30000;", cancellationToken);
+        await UpgradeLegacyAuditIntegrityAsync(db, audit, auth.TenantId, cancellationToken);
 
         var now = clock.GetUtcNow();
         if (!await db.Tenants.IgnoreQueryFilters().AnyAsync(x => x.TenantId == auth.TenantId, cancellationToken))
@@ -127,5 +130,46 @@ public static class DbInitializer
         }
 
         await db.SaveChangesAsync(cancellationToken);
+    }
+
+    public static async Task<int> UpgradeLegacyAuditIntegrityAsync(
+        AppDbContext db,
+        AuditService audit,
+        Guid tenantId,
+        CancellationToken cancellationToken = default)
+    {
+        if (tenantId == Guid.Empty) throw new ArgumentException("A tenant ID is required.", nameof(tenantId));
+        var entries = await db.AuditLogs
+            .IgnoreQueryFilters()
+            .Where(x => x.TenantId == tenantId)
+            .AsNoTracking()
+            .ToListAsync(cancellationToken);
+        var upgraded = 0;
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        foreach (var entry in entries)
+        {
+            if (audit.HasCurrentIntegrity(entry)) continue;
+
+            var hasPreviousIntegrity = audit.HasPreviousIntegrity(entry);
+            var hasLegacyIntegrity = audit.HasLegacyIntegrity(entry);
+            if (!hasPreviousIntegrity && !hasLegacyIntegrity) continue;
+
+            var legacyHash = entry.IntegrityHash;
+            if (!hasPreviousIntegrity) entry.IpAddress = null;
+            var currentHash = audit.ComputeIntegrityHash(entry);
+            var affected = await db.Database.ExecuteSqlInterpolatedAsync($"""
+                UPDATE AuditLogs
+                SET IpAddress = {entry.IpAddress}, IntegrityHash = {currentHash}
+                WHERE Id = {entry.Id} AND TenantId = {tenantId} AND IntegrityHash = {legacyHash}
+                """, cancellationToken);
+            if (affected != 1)
+            {
+                throw new InvalidOperationException("An audit record changed during the integrity upgrade.");
+            }
+            upgraded++;
+        }
+        await transaction.CommitAsync(cancellationToken);
+        return upgraded;
     }
 }

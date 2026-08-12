@@ -1,11 +1,15 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Microsoft.Extensions.Options;
 using WeChatBot.Backend.Domain;
 using WeChatBot.Backend.Infrastructure;
 
 namespace WeChatBot.Backend.Data;
 
-public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TenantContext tenantContext)
+public sealed class AppDbContext(
+    DbContextOptions<AppDbContext> options,
+    TenantContext tenantContext,
+    IOptions<AuthOptions> authOptions)
     : DbContext(options)
 {
     public DbSet<TenantState> Tenants => Set<TenantState>();
@@ -260,6 +264,21 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options, TenantC
 
     private void EnforceImmutableRecords()
     {
+        var expectedTenantId = tenantContext.TenantId == Guid.Empty
+            ? authOptions.Value.TenantId
+            : tenantContext.TenantId;
+        var invalidTenantEntries = ChangeTracker.Entries<ITenantEntity>()
+            .Where(x => x.State is EntityState.Added or EntityState.Modified or EntityState.Deleted &&
+                        (expectedTenantId == Guid.Empty ||
+                         x.Entity.TenantId != expectedTenantId ||
+                         x.State is EntityState.Modified or EntityState.Deleted &&
+                         x.Property(entity => entity.TenantId).OriginalValue != expectedTenantId))
+            .ToArray();
+        if (invalidTenantEntries.Length > 0)
+        {
+            throw new InvalidOperationException("Tenant-scoped records must match the authenticated tenant.");
+        }
+
         var immutableChanges = ChangeTracker.Entries()
             .Where(x => (x.Entity is AuditLog || x.Entity is EntitlementLedger) &&
                         x.State is EntityState.Modified or EntityState.Deleted)

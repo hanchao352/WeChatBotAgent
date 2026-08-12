@@ -14,7 +14,7 @@ public interface IWeChatProcessDetector
     IReadOnlyList<WeChatProcessDescriptor> DetectMainProcesses();
 }
 
-public sealed class WeChatProcessDetector : IWeChatProcessDetector
+public sealed class WeChatProcessDetector(int? sessionId = null) : IWeChatProcessDetector
 {
     private static readonly HashSet<string> SupportedProcessNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -26,6 +26,7 @@ public sealed class WeChatProcessDetector : IWeChatProcessDetector
     {
         var detectedAt = DateTimeOffset.UtcNow;
         var results = new List<WeChatProcessDescriptor>();
+        var targetSessionId = sessionId ?? Process.GetCurrentProcess().SessionId;
 
         foreach (var process in Process.GetProcesses())
         {
@@ -33,7 +34,9 @@ public sealed class WeChatProcessDetector : IWeChatProcessDetector
             {
                 try
                 {
-                    if (!SupportedProcessNames.Contains(process.ProcessName) || process.MainWindowHandle == nint.Zero)
+                    if (process.SessionId != targetSessionId ||
+                        !SupportedProcessNames.Contains(process.ProcessName) ||
+                        process.MainWindowHandle == nint.Zero)
                     {
                         continue;
                     }

@@ -140,20 +140,13 @@ public sealed class LogicalBackupService(
             try
             {
                 var plaintext = Decrypt(bytes, GetEncryptionKey());
-                var payload = JsonSerializer.Deserialize<LogicalBackupPayload>(plaintext, JsonOptions);
-                var expectedCounts = JsonSerializer.Deserialize<Dictionary<string, int>>(manifest.CountsJson, JsonOptions);
-                valid = payload is not null &&
-                        IsSupportedSchema(payload.SchemaVersion) &&
-                        payload.SchemaVersion == manifest.SchemaVersion &&
-                        payload.TenantId == tenant.TenantId &&
-                        expectedCounts is not null &&
-                        CountsEqual(expectedCounts, CalculateCounts(payload));
+                var payload = JsonSerializer.Deserialize<LogicalBackupPayload>(plaintext, JsonOptions)
+                              ?? throw new JsonException("Backup payload is empty.");
+                var expectedCounts = JsonSerializer.Deserialize<Dictionary<string, int>>(manifest.CountsJson, JsonOptions)
+                                     ?? throw new JsonException("Backup manifest counts are empty.");
+                await ValidatePayloadAsync(payload, manifest, expectedCounts, cancellationToken);
             }
-            catch (CryptographicException)
-            {
-                valid = false;
-            }
-            catch (JsonException)
+            catch (Exception exception) when (exception is CryptographicException or JsonException or DomainException)
             {
                 valid = false;
             }
@@ -189,6 +182,7 @@ public sealed class LogicalBackupService(
         string idempotencyKey,
         CancellationToken cancellationToken)
     {
+        idempotencyKey = idempotencyKey?.Trim() ?? string.Empty;
         if (!string.Equals(confirmation, "RESTORE", StringComparison.Ordinal))
             throw DomainException.Validation("restore_confirmation_required", "Set confirmation to RESTORE to perform a logical restore.");
         if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128)
@@ -225,20 +219,29 @@ public sealed class LogicalBackupService(
         {
             throw DomainException.Conflict("backup_payload_invalid", "Backup decryption or payload validation failed; restore was not started.");
         }
-        if (!IsSupportedSchema(payload.SchemaVersion) ||
-            payload.SchemaVersion != manifest.SchemaVersion ||
-            payload.TenantId != tenant.TenantId)
-            throw DomainException.Conflict("backup_schema_mismatch", "Backup schema or tenant does not match the restore target.");
-        if (!CountsEqual(manifestCounts, CalculateCounts(payload)))
-            throw DomainException.Conflict("backup_manifest_mismatch", "Backup record counts do not match the manifest.");
+        await ValidatePayloadAsync(payload, manifest, manifestCounts, cancellationToken);
+
+        var startedAt = timeProvider.GetUtcNow();
+        var tenantState = await db.Tenants.SingleAsync(cancellationToken);
+        if (!tenantState.AutomationPaused)
+        {
+            tenantState.AutomationPaused = true;
+            tenantState.UpdatedAt = startedAt;
+            tenantState.Version++;
+            audit.Add(
+                "automation.paused-for-restore",
+                nameof(TenantState),
+                tenantState.TenantId.ToString("D"),
+                details: new { backupId });
+            await db.SaveChangesAsync(cancellationToken);
+        }
 
         var preRestore = await CreateAsync("automatic-pre-restore", cancellationToken);
         db.ChangeTracker.Clear();
-        var startedAt = timeProvider.GetUtcNow();
         var restored = new Dictionary<string, int>(StringComparer.Ordinal);
 
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        var tenantState = await db.Tenants.SingleAsync(cancellationToken);
+        tenantState = await db.Tenants.SingleAsync(cancellationToken);
         if (payload.Tenant is not null)
         {
             tenantState.Name = payload.Tenant.Name;
@@ -256,7 +259,7 @@ public sealed class LogicalBackupService(
         restored["activationCodes"] = await AddMissingAsync(db.ActivationCodes, payload.ActivationCodes, x => x.Id, cancellationToken);
         restored["entitlementLedger"] = await AddMissingAsync(db.EntitlementLedger, payload.EntitlementLedger, x => x.Id, cancellationToken);
         restored["groupMentions"] = await AddMissingAsync(db.GroupMentions, payload.GroupMentions, x => x.Id, cancellationToken);
-        restored["auditLogs"] = await AddMissingAsync(db.AuditLogs, payload.AuditLogs, x => x.Id, cancellationToken);
+        restored["auditLogs"] = await AddMissingAuditLogsAsync(payload.AuditLogs, cancellationToken);
 
         // Existing entitlement, redemption and ledger rows are authoritative and are never overwritten by an older snapshot.
         var restoreId = Guid.NewGuid();
@@ -427,6 +430,283 @@ public sealed class LogicalBackupService(
         if (missing.Count > 0) await set.AddRangeAsync(missing, cancellationToken);
         return missing.Count;
     }
+
+    private void EnsureAuditLogsHaveValidIntegrity(IEnumerable<AuditLog> source)
+    {
+        if (source.Any(x => x.TenantId != tenant.TenantId || !audit.HasValidIntegrity(x)))
+        {
+            throw DomainException.Conflict(
+                "backup_audit_integrity_failed",
+                "Backup audit records failed tenant or integrity validation; restore was not started.");
+        }
+    }
+
+    private async Task ValidatePayloadAsync(
+        LogicalBackupPayload payload,
+        BackupManifest manifest,
+        IReadOnlyDictionary<string, int> manifestCounts,
+        CancellationToken cancellationToken)
+    {
+        EnsurePayloadCollectionsArePresent(payload);
+        if (!IsSupportedSchema(payload.SchemaVersion) ||
+            payload.SchemaVersion != manifest.SchemaVersion ||
+            payload.TenantId != tenant.TenantId)
+        {
+            throw DomainException.Conflict(
+                "backup_schema_mismatch",
+                "Backup schema or tenant does not match the restore target.");
+        }
+        if (!CountsEqual(manifestCounts, CalculateCounts(payload)))
+        {
+            throw DomainException.Conflict(
+                "backup_manifest_mismatch",
+                "Backup record counts do not match the manifest.");
+        }
+
+        EnsurePayloadTenantIsolation(payload);
+        await EnsurePayloadReferentialIntegrityAsync(payload, cancellationToken);
+        await EnsurePayloadPackageReferencesAsync(payload, cancellationToken);
+        EnsureAuditLogsHaveValidIntegrity(payload.AuditLogs);
+    }
+
+    private static void EnsurePayloadCollectionsArePresent(LogicalBackupPayload payload)
+    {
+        if (payload.AgentRegistrations is null ||
+            payload.Contacts is null ||
+            payload.Groups is null ||
+            payload.RemarkRules is null ||
+            payload.RemarkTasks is null ||
+            payload.GroupMentions is null ||
+            payload.Entitlements is null ||
+            payload.EntitlementLedger is null ||
+            payload.ActivationCodes is null ||
+            payload.AuditLogs is null)
+        {
+            throw DomainException.Conflict(
+                "backup_payload_invalid",
+                "Backup payload is missing one or more required collections.");
+        }
+    }
+
+    private void EnsurePayloadTenantIsolation(LogicalBackupPayload payload)
+    {
+        var tenantId = tenant.TenantId;
+        var containsForeignTenant =
+            (payload.Tenant is not null && payload.Tenant.TenantId != tenantId) ||
+            payload.AgentRegistrations.Any(x => x.TenantId != tenantId) ||
+            payload.Contacts.Any(x => x.TenantId != tenantId) ||
+            payload.Groups.Any(x => x.TenantId != tenantId) ||
+            payload.RemarkRules.Any(x => x.TenantId != tenantId) ||
+            payload.RemarkTasks.Any(x => x.TenantId != tenantId) ||
+            payload.GroupMentions.Any(x => x.TenantId != tenantId) ||
+            payload.Entitlements.Any(x => x.TenantId != tenantId) ||
+            payload.EntitlementLedger.Any(x => x.TenantId != tenantId) ||
+            payload.ActivationCodes.Any(x => x.TenantId != tenantId) ||
+            payload.AuditLogs.Any(x => x.TenantId != tenantId);
+        if (containsForeignTenant)
+        {
+            throw DomainException.Conflict(
+                "backup_tenant_scope_invalid",
+                "Backup payload contains records outside the restore tenant; restore was not started.");
+        }
+    }
+
+    private async Task EnsurePayloadReferentialIntegrityAsync(
+        LogicalBackupPayload payload,
+        CancellationToken cancellationToken)
+    {
+        var contactIds = payload.Contacts.Select(x => x.Id).ToHashSet();
+        var groupIds = payload.Groups.Select(x => x.Id).ToHashSet();
+        var ruleIds = payload.RemarkRules.Select(x => x.Id).ToHashSet();
+        var entitlementIds = payload.Entitlements.Select(x => x.Id).ToHashSet();
+        var activationCodeIds = payload.ActivationCodes.Select(x => x.Id).ToHashSet();
+
+        var referencedRuleIds = payload.RemarkTasks.Select(x => x.RuleId)
+            .Where(x => !ruleIds.Contains(x))
+            .Distinct()
+            .ToArray();
+        var validExistingRuleIds = await db.RemarkRules.AsNoTracking()
+            .Where(x => referencedRuleIds.Contains(x.Id))
+            .Select(x => x.Id)
+            .ToHashSetAsync(cancellationToken);
+        var referencedContactIds = payload.RemarkTasks
+            .Where(x => x.TargetKind == ServiceTargetKind.Contact)
+            .Select(x => x.TargetId)
+            .Concat(payload.Entitlements
+                .Where(x => x.TargetKind == ServiceTargetKind.Contact)
+                .Select(x => x.TargetId))
+            .Where(x => !contactIds.Contains(x))
+            .Distinct()
+            .ToArray();
+        var validExistingContactIds = await db.Contacts.AsNoTracking()
+            .Where(x => referencedContactIds.Contains(x.Id))
+            .Select(x => x.Id)
+            .ToHashSetAsync(cancellationToken);
+        var allReferencedGroupIds = payload.GroupMentions.Select(x => x.GroupId)
+            .Concat(payload.RemarkTasks
+                .Where(x => x.TargetKind == ServiceTargetKind.Group)
+                .Select(x => x.TargetId))
+            .Concat(payload.Entitlements
+                .Where(x => x.TargetKind == ServiceTargetKind.Group)
+                .Select(x => x.TargetId));
+        var referencedGroupIds = allReferencedGroupIds
+            .Where(x => !groupIds.Contains(x))
+            .Distinct()
+            .ToArray();
+        var validExistingGroupIds = await db.Groups.AsNoTracking()
+            .Where(x => referencedGroupIds.Contains(x.Id))
+            .Select(x => x.Id)
+            .ToHashSetAsync(cancellationToken);
+        var referencedEntitlementIds = payload.EntitlementLedger.Select(x => x.EntitlementId)
+            .Concat(payload.GroupMentions
+                .Where(x => x.EntitlementId.HasValue)
+                .Select(x => x.EntitlementId!.Value))
+            .Where(x => !entitlementIds.Contains(x))
+            .Distinct()
+            .ToArray();
+        var validExistingEntitlementIds = await db.Entitlements.AsNoTracking()
+            .Where(x => referencedEntitlementIds.Contains(x.Id))
+            .Select(x => x.Id)
+            .ToHashSetAsync(cancellationToken);
+
+        var containsInvalidIds =
+            HasInvalidOrDuplicateIds(payload.AgentRegistrations, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.Contacts, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.Groups, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.RemarkRules, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.RemarkTasks, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.GroupMentions, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.Entitlements, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.EntitlementLedger, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.ActivationCodes, x => x.Id) ||
+            HasInvalidOrDuplicateIds(payload.AuditLogs, x => x.Id);
+        var containsInvalidReferences =
+            payload.RemarkTasks.Any(x =>
+                !ruleIds.Contains(x.RuleId) && !validExistingRuleIds.Contains(x.RuleId) ||
+                !TargetExists(
+                    x.TargetKind,
+                    x.TargetId,
+                    contactIds,
+                    validExistingContactIds,
+                    groupIds,
+                    validExistingGroupIds)) ||
+            payload.GroupMentions.Any(x =>
+                !groupIds.Contains(x.GroupId) && !validExistingGroupIds.Contains(x.GroupId) ||
+                x.EntitlementId.HasValue &&
+                !entitlementIds.Contains(x.EntitlementId.Value) &&
+                !validExistingEntitlementIds.Contains(x.EntitlementId.Value)) ||
+            payload.Entitlements.Any(x =>
+                !TargetExists(
+                    x.TargetKind,
+                    x.TargetId,
+                    contactIds,
+                    validExistingContactIds,
+                    groupIds,
+                    validExistingGroupIds) ||
+                (x.ActivationCodeId.HasValue && !activationCodeIds.Contains(x.ActivationCodeId.Value))) ||
+            payload.EntitlementLedger.Any(x =>
+                !entitlementIds.Contains(x.EntitlementId) &&
+                !validExistingEntitlementIds.Contains(x.EntitlementId)) ||
+            payload.ActivationCodes.Any(x =>
+                (x.EntitlementId.HasValue && !entitlementIds.Contains(x.EntitlementId.Value)) ||
+                (x.RedeemedAt.HasValue != x.EntitlementId.HasValue) ||
+                (x.RedeemedAt.HasValue != x.RedeemedTargetKind.HasValue) ||
+                (x.RedeemedAt.HasValue != x.RedeemedTargetId.HasValue));
+
+        if (containsInvalidIds || containsInvalidReferences)
+        {
+            throw DomainException.Conflict(
+                "backup_reference_integrity_failed",
+                "Backup records contain invalid or cross-tenant references; restore was not started.");
+        }
+    }
+
+    private async Task EnsurePayloadPackageReferencesAsync(
+        LogicalBackupPayload payload,
+        CancellationToken cancellationToken)
+    {
+        var packageIds = payload.Entitlements.Select(x => x.PackageId)
+            .Concat(payload.ActivationCodes.Select(x => x.PackageId))
+            .Distinct()
+            .ToArray();
+        var packages = await db.ServicePackages.AsNoTracking()
+            .Where(x => packageIds.Contains(x.Id))
+            .ToDictionaryAsync(x => x.Id, cancellationToken);
+        var invalidPackageReference = packages.Count != packageIds.Length;
+        var invalidAdvancedTarget = payload.Entitlements.Any(x =>
+                packages.TryGetValue(x.PackageId, out var package) &&
+                package.Tier == PackageTier.AdvancedGeneral &&
+                x.TargetKind != ServiceTargetKind.Group) ||
+            payload.ActivationCodes.Any(x =>
+                x.RedeemedAt.HasValue &&
+                packages.TryGetValue(x.PackageId, out var package) &&
+                package.Tier == PackageTier.AdvancedGeneral &&
+                x.RedeemedTargetKind != ServiceTargetKind.Group);
+        if (invalidPackageReference || invalidAdvancedTarget)
+        {
+            throw DomainException.Conflict(
+                "backup_package_reference_invalid",
+                "Backup records reference a missing package or an unsupported package target; restore was not started.");
+        }
+    }
+
+    private static bool HasInvalidOrDuplicateIds<TEntity>(
+        IReadOnlyCollection<TEntity> source,
+        Func<TEntity, Guid> keySelector)
+    {
+        var ids = source.Select(keySelector).ToArray();
+        return ids.Any(x => x == Guid.Empty) || ids.Distinct().Count() != ids.Length;
+    }
+
+    private static bool TargetExists(
+        ServiceTargetKind targetKind,
+        Guid targetId,
+        IReadOnlySet<Guid> payloadContactIds,
+        IReadOnlySet<Guid> existingContactIds,
+        IReadOnlySet<Guid> payloadGroupIds,
+        IReadOnlySet<Guid> existingGroupIds) => targetKind switch
+        {
+            ServiceTargetKind.Contact => payloadContactIds.Contains(targetId) || existingContactIds.Contains(targetId),
+            ServiceTargetKind.Group => payloadGroupIds.Contains(targetId) || existingGroupIds.Contains(targetId),
+            _ => false
+        };
+
+    private async Task<int> AddMissingAuditLogsAsync(
+        IReadOnlyCollection<AuditLog> source,
+        CancellationToken cancellationToken)
+    {
+        var sourceById = source.ToDictionary(x => x.Id);
+        var existing = await db.AuditLogs.AsNoTracking()
+            .Where(x => sourceById.Keys.Contains(x.Id))
+            .ToListAsync(cancellationToken);
+        if (existing.Any(x =>
+                !sourceById.TryGetValue(x.Id, out var restored) ||
+                !audit.HasValidIntegrity(x) ||
+                !AuditLogsEqual(x, restored)))
+        {
+            throw DomainException.Conflict(
+                "backup_audit_conflict",
+                "A backup audit record conflicts with the authoritative audit history; restore was not started.");
+        }
+
+        var existingIds = existing.Select(x => x.Id).ToHashSet();
+        var missing = source.Where(x => !existingIds.Contains(x.Id)).ToList();
+        if (missing.Count > 0) await db.AuditLogs.AddRangeAsync(missing, cancellationToken);
+        return missing.Count;
+    }
+
+    private static bool AuditLogsEqual(AuditLog left, AuditLog right) =>
+        left.Id == right.Id &&
+        left.TenantId == right.TenantId &&
+        left.CreatedAt == right.CreatedAt &&
+        string.Equals(left.Actor, right.Actor, StringComparison.Ordinal) &&
+        string.Equals(left.Action, right.Action, StringComparison.Ordinal) &&
+        string.Equals(left.ResourceType, right.ResourceType, StringComparison.Ordinal) &&
+        string.Equals(left.ResourceId, right.ResourceId, StringComparison.Ordinal) &&
+        left.Success == right.Success &&
+        string.Equals(left.IpAddress, right.IpAddress, StringComparison.Ordinal) &&
+        string.Equals(left.CorrelationId, right.CorrelationId, StringComparison.Ordinal) &&
+        string.Equals(left.DetailsJson, right.DetailsJson, StringComparison.Ordinal);
 
     private async Task<byte[]> ReadBackupAsync(BackupManifest manifest, CancellationToken cancellationToken)
     {

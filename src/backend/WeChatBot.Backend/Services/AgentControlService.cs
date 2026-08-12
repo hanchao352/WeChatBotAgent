@@ -13,8 +13,10 @@ public sealed class AgentControlService(
     AuditService audit)
 {
     private static readonly TimeSpan MaximumClockSkew = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan MaximumHeartbeatAge = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan OnlineWindow = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan RejectionAuditInterval = TimeSpan.FromMinutes(5);
+    private const int HeartbeatUpdateAttempts = 8;
 
     public async Task<AgentHeartbeatResponse> RecordHeartbeatAsync(
         AgentHeartbeatRequest request,
@@ -73,9 +75,65 @@ public sealed class AgentControlService(
 
         await UpsertHeartbeatStateAsync(registration.Id, request, now, cancellationToken);
         return new AgentHeartbeatResponse(
-            registration.IsEnabled,
+            registration.IsEnabled && request.DryRun,
             emergencyStop,
             registration.ConfigurationVersion);
+    }
+
+    public async Task EnsureActiveBindingAsync(
+        string agentId,
+        string weChatInstanceId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(agentId) || agentId.Length > 128 ||
+            string.IsNullOrWhiteSpace(weChatInstanceId) || weChatInstanceId.Length > 128)
+        {
+            throw DomainException.Validation(
+                "invalid_agent_binding",
+                "AgentId and WeChatInstanceId are required and must be at most 128 characters.");
+        }
+
+        var normalizedAgentId = NormalizeAgentId(agentId);
+        var normalizedInstanceId = weChatInstanceId.Trim();
+        var onlineAfter = timeProvider.GetUtcNow() - OnlineWindow;
+        var controlState = await db.Tenants.AsNoTracking()
+            .Select(x => new { x.AutomationPaused, x.UpdatedAt })
+            .SingleAsync(cancellationToken);
+        if (controlState.AutomationPaused)
+        {
+            throw DomainException.Conflict(
+                "automation_paused",
+                "Automation is paused; Agent operations are unavailable.");
+        }
+
+        var registration = await db.AgentRegistrations.AsNoTracking()
+            .SingleOrDefaultAsync(
+                x => x.NormalizedAgentId == normalizedAgentId,
+                cancellationToken);
+        if (registration is null ||
+            !registration.IsEnabled ||
+            !string.Equals(registration.WeChatInstanceId, normalizedInstanceId, StringComparison.Ordinal))
+        {
+            throw DomainException.Conflict(
+                "agent_lease_unavailable",
+                "The active Agent binding could not be verified.");
+        }
+
+        var state = await db.AgentHeartbeatStates.AsNoTracking()
+            .SingleOrDefaultAsync(
+                x => x.AgentRegistrationId == registration.Id,
+                cancellationToken);
+        if (state is null ||
+            state.ReceivedAt < onlineAfter ||
+            state.SentAt < onlineAfter ||
+            state.ReceivedAt < controlState.UpdatedAt ||
+            state.RuntimeState != AgentOperatingState.Healthy ||
+            !state.DryRun)
+        {
+            throw DomainException.Conflict(
+                "agent_lease_unavailable",
+                "The active Agent binding could not be verified.");
+        }
     }
 
     public async Task<IReadOnlyList<AgentListItem>> ListAsync(CancellationToken cancellationToken)
@@ -169,7 +227,7 @@ public sealed class AgentControlService(
         DateTimeOffset receivedAt,
         CancellationToken cancellationToken)
     {
-        for (var attempt = 0; attempt < 3; attempt++)
+        for (var attempt = 0; attempt < HeartbeatUpdateAttempts; attempt++)
         {
             var state = await db.AgentHeartbeatStates
                 .SingleOrDefaultAsync(x => x.AgentRegistrationId == registrationId, cancellationToken);
@@ -191,9 +249,10 @@ public sealed class AgentControlService(
                 await db.SaveChangesAsync(cancellationToken);
                 return;
             }
-            catch (DbUpdateException) when (attempt < 2)
+            catch (DbUpdateException) when (attempt < HeartbeatUpdateAttempts - 1)
             {
                 db.ChangeTracker.Clear();
+                await Task.Delay(TimeSpan.FromMilliseconds(5 * (attempt + 1)), cancellationToken);
             }
         }
 
@@ -226,6 +285,8 @@ public sealed class AgentControlService(
             throw DomainException.Validation("invalid_heartbeat_timestamp", "Heartbeat timestamps are required.");
         if (request.SentAt > now + MaximumClockSkew)
             throw DomainException.Validation("heartbeat_clock_skew", "Heartbeat SentAt is too far in the future.");
+        if (request.SentAt < now - MaximumHeartbeatAge)
+            throw DomainException.Validation("stale_heartbeat", "Heartbeat SentAt is too old to establish an online lease.");
         if (request.Runtime.ChangedAt > request.SentAt + MaximumClockSkew ||
             request.Runtime.LastCommandCompletedAt > request.SentAt + MaximumClockSkew)
             throw DomainException.Validation("invalid_runtime_timestamp", "Runtime timestamps cannot be later than the heartbeat.");

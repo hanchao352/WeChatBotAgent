@@ -122,11 +122,18 @@ app.UseStatusCodePages(async statusCodeContext =>
         }
     }, cancellationToken: statusCodeContext.HttpContext.RequestAborted);
 });
-app.UseSwagger();
-app.UseSwaggerUI();
+if (localEnvironment)
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
+if (!localEnvironment)
+{
+    app.Map("/swagger/{**path}", () => Results.NotFound()).AllowAnonymous();
+}
 
 await DbInitializer.InitializeAsync(app.Services, localEnvironment);
 await app.RunAsync();
@@ -150,6 +157,15 @@ static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvi
         throw new InvalidOperationException("Auth__ApiKey and Auth__AgentApiKey must be different secrets.");
     RequireSecret(configuration["Activation:HashPepper"], "Activation__HashPepper", 32);
     RequireSecret(configuration["Audit:IntegrityKey"], "Audit__IntegrityKey", 32);
+    RequireActor(configuration["Auth:ActorName"], "Auth__ActorName");
+    RequireActor(configuration["Auth:AgentActorName"], "Auth__AgentActorName");
+    if (string.Equals(
+            configuration["Auth:ActorName"]?.Trim(),
+            configuration["Auth:AgentActorName"]?.Trim(),
+            StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException("Auth__ActorName and Auth__AgentActorName must identify different actors.");
+    }
     var backupKey = configuration["Backup:EncryptionKeyBase64"];
     try
     {
@@ -169,6 +185,15 @@ static void RequireSecret(string? value, string environmentVariable, int minimum
 {
     if (string.IsNullOrWhiteSpace(value) || value.Length < minimumLength)
         throw new InvalidOperationException($"{environmentVariable} is required and must be at least {minimumLength} characters.");
+}
+
+static void RequireActor(string? value, string environmentVariable)
+{
+    if (string.IsNullOrWhiteSpace(value) || value.Trim().Length > 128 || value.Contains('|', StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException(
+            $"{environmentVariable} is required, must be at most 128 characters, and cannot contain '|'.");
+    }
 }
 
 static void EnsureSqliteDirectory(string? connectionString)

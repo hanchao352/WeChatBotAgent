@@ -1,6 +1,6 @@
 # WeChatBot Backend Core
 
-这是 .NET 10 + ASP.NET Core + EF Core 的首个商业化纵向切片。当前数据库提供者为 SQLite，领域模型和 `DbContext` 未使用 SQLite 专属业务类型；切换 PostgreSQL 时需要替换提供者注册并生成独立迁移。
+这是 .NET 10 + ASP.NET Core + EF Core 的首个商业化方向纵向切片，不代表已达到商业生产上线条件。当前数据库提供者为 SQLite，领域模型和 `DbContext` 未使用 SQLite 专属业务类型；切换 PostgreSQL 时需要替换提供者注册并生成独立迁移。
 
 ## 已实现范围
 
@@ -37,7 +37,7 @@ X-Api-Key: wechatbot-local-development-key-change-me
 后台使用相互独立的两类 API Key，禁止混用或向另一角色下放：
 
 - 管理员 Key（`Auth__ApiKey`）用于管理、审计、备份恢复和 Agent 列表等 Admin 接口，只能由可信管理端持有。
-- Agent Key（`Auth__AgentApiKey`）仅用于 Agent 向控制面提交心跳，不授予任何 Admin 接口权限。
+- Agent Key（`Auth__AgentApiKey`）仅用于 Agent 向控制面提交心跳，以及在匹配的健康 dry-run 绑定下上报群消息；不授予任何 Admin 接口权限。
 - `Auth__ActorName` 和 `Auth__AgentActorName` 分别标识管理员与 Agent 的审计主体，不能用同一角色名掩盖调用来源。
 
 当前版本的 Agent Key 是所有 Agent 共享的基线凭据，只适合受控网络内的初始部署。正式商业生产环境必须升级为设备预注册的独立凭据或客户端证书，使每台设备可单独识别、轮换和吊销；共享 Agent Key 不能作为最终生产身份方案。
@@ -77,6 +77,7 @@ $env:ConnectionStrings__Database = 'Data Source=D:\WeChatBotData\wechatbot.db;De
 | 备注规则/任务 | `/api/remark-rules`、`/api/remark-tasks` |
 | 群 @ 事件 | `/api/group-mentions` |
 | Agent 心跳（Agent 角色） | `POST /api/agents/heartbeat` |
+| Agent 群消息上报（Agent 角色） | `POST /api/agents/{agentId}/group-mentions` |
 | Agent 列表（Admin 角色） | `GET /api/agents` |
 | 服务包/权益 | `/api/service-packages`、`/api/entitlements` |
 | 激活码 | `/api/activation-codes`、`/api/activation-codes/redeem` |
@@ -86,6 +87,8 @@ $env:ConnectionStrings__Database = 'Data Source=D:\WeChatBotData\wechatbot.db;De
 | 健康检查 | `/health/live`、`/health/ready` |
 
 激活兑换、备注任务创建和备份恢复要求 `Idempotency-Key` 请求头。恢复还要求正文中的 `confirmation` 精确为 `RESTORE`；恢复采用合并策略，不覆盖当前数据库中更可信的兑换、撤销和权益流水，并始终将自动化状态置为暂停，需人工核对后显式恢复。
+
+当前没有向 Agent 角色开放备注任务领取或结果回报。`RemarkTask` 还缺少认领 Agent、不可猜测的租约令牌、租约到期时间、尝试次数和结果去重标识；在这些字段及原子认领/续租/完成协议通过数据库迁移落地前，多 Agent 消费会存在重复执行和越权回报风险。现有 `/api/remark-tasks/{id}/complete` 是管理员业务接口，不是 Agent 执行协议。
 
 当前恢复接口的真实模式是 `in-place-merge`：它在同一租户数据库中先创建恢复前快照，再写入备份中的配置并补齐缺失历史事实。它不会创建隔离数据库、临时环境或生产切换任务，因此管理端不得将该接口标注为“隔离恢复”。真正的隔离恢复和切换编排属于后续灾备能力。
 

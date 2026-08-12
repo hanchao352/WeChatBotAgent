@@ -52,6 +52,41 @@ public sealed class AuditService(
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
+    public string ComputeIntegrityHash(AuditLog entry) => StableHash.HmacSha256(
+        Canonicalize(entry),
+        options.Value.IntegrityKey);
+
+    public bool HasCurrentIntegrity(AuditLog entry) => HashEquals(
+        entry.IntegrityHash,
+        ComputeIntegrityHash(entry));
+
+    public bool HasLegacyIntegrity(AuditLog entry) => HashEquals(
+        entry.IntegrityHash,
+        ComputeLegacyIntegrityHash(entry)) && HasSafeDelimitedFields(entry);
+
+    public bool HasPreviousIntegrity(AuditLog entry) => HashEquals(
+        entry.IntegrityHash,
+        ComputePreviousIntegrityHash(entry)) && HasSafeDelimitedFields(entry);
+
+    public bool HasValidIntegrity(AuditLog entry) =>
+        HasCurrentIntegrity(entry) ||
+        HasPreviousIntegrity(entry) ||
+        (string.IsNullOrEmpty(entry.IpAddress) && HasLegacyIntegrity(entry));
+
+    private static bool HashEquals(string stored, string expected)
+    {
+        try
+        {
+            return CryptographicOperations.FixedTimeEquals(
+                Convert.FromHexString(stored),
+                Convert.FromHexString(expected));
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
     public AuditLog Add(
         string action,
         string resourceType,
@@ -74,10 +109,49 @@ public sealed class AuditService(
             CorrelationId = tenant.CorrelationId,
             DetailsJson = detailsJson
         };
-        entry.IntegrityHash = StableHash.HmacSha256(
-            $"{entry.Id:N}|{entry.TenantId:N}|{entry.CreatedAt:O}|{entry.Actor}|{entry.Action}|{entry.ResourceType}|{entry.ResourceId}|{entry.Success}|{entry.CorrelationId}|{entry.DetailsJson}",
-            options.Value.IntegrityKey);
+        entry.IntegrityHash = ComputeIntegrityHash(entry);
         db.AuditLogs.Add(entry);
         return entry;
     }
+
+    private static string Canonicalize(AuditLog entry)
+    {
+        var canonical = new StringBuilder("audit-v2");
+        AppendField(canonical, entry.Id.ToString("N"));
+        AppendField(canonical, entry.TenantId.ToString("N"));
+        AppendField(canonical, entry.CreatedAt.UtcTicks.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        AppendField(canonical, entry.Actor);
+        AppendField(canonical, entry.Action);
+        AppendField(canonical, entry.ResourceType);
+        AppendField(canonical, entry.ResourceId);
+        AppendField(canonical, entry.Success ? "1" : "0");
+        AppendField(canonical, entry.IpAddress ?? string.Empty);
+        AppendField(canonical, entry.CorrelationId);
+        AppendField(canonical, entry.DetailsJson);
+        return canonical.ToString();
+    }
+
+    private static void AppendField(StringBuilder canonical, string value)
+    {
+        canonical.Append('|');
+        canonical.Append(value.Length.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        canonical.Append(':');
+        canonical.Append(value);
+    }
+
+    private string ComputePreviousIntegrityHash(AuditLog entry) => StableHash.HmacSha256(
+        $"{entry.Id:N}|{entry.TenantId:N}|{entry.CreatedAt:O}|{entry.Actor}|{entry.Action}|{entry.ResourceType}|{entry.ResourceId}|{entry.Success}|{entry.IpAddress ?? string.Empty}|{entry.CorrelationId}|{entry.DetailsJson}",
+        options.Value.IntegrityKey);
+
+    private string ComputeLegacyIntegrityHash(AuditLog entry) => StableHash.HmacSha256(
+        $"{entry.Id:N}|{entry.TenantId:N}|{entry.CreatedAt:O}|{entry.Actor}|{entry.Action}|{entry.ResourceType}|{entry.ResourceId}|{entry.Success}|{entry.CorrelationId}|{entry.DetailsJson}",
+        options.Value.IntegrityKey);
+
+    private static bool HasSafeDelimitedFields(AuditLog entry) =>
+        !entry.Actor.Contains('|', StringComparison.Ordinal) &&
+        !entry.Action.Contains('|', StringComparison.Ordinal) &&
+        !entry.ResourceType.Contains('|', StringComparison.Ordinal) &&
+        !entry.ResourceId.Contains('|', StringComparison.Ordinal) &&
+        !(entry.IpAddress?.Contains('|', StringComparison.Ordinal) ?? false) &&
+        !entry.CorrelationId.Contains('|', StringComparison.Ordinal);
 }

@@ -1,4 +1,17 @@
-const apiKey = import.meta.env.VITE_API_KEY ?? (import.meta.env.DEV ? 'wechatbot-local-development-key-change-me' : '')
+// Browser-delivered API keys are acceptable only for local development. Production
+// deployments must authenticate at a same-origin BFF/session boundary.
+const apiKey = import.meta.env.DEV
+  ? (import.meta.env.VITE_API_KEY ?? 'wechatbot-local-development-key-change-me')
+  : ''
+
+const requestTimeoutMs = 10_000
+
+export class ApiConnectionError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'ApiConnectionError'
+  }
+}
 
 export type ApiContact = {
   id: string
@@ -154,27 +167,44 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   if (apiKey) headers.set('X-Api-Key', apiKey)
   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  const response = await fetch(path, { ...init, headers })
+  let response: Response
+  try {
+    response = await fetch(path, {
+      ...init,
+      headers,
+      signal: init.signal ?? AbortSignal.timeout(requestTimeoutMs),
+    })
+  } catch (error) {
+    const timedOut = error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')
+    throw new ApiConnectionError(timedOut ? '控制面请求超时' : '无法连接控制面', { cause: error })
+  }
   if (!response.ok) {
     const problem = await response.json().catch(() => null) as { title?: string; detail?: string; errorCode?: string } | null
-    throw new Error(problem?.detail ?? problem?.title ?? problem?.errorCode ?? `API request failed (${response.status})`)
+    const message = problem?.detail ?? problem?.title ?? problem?.errorCode
+    if (response.status === 401 || response.status === 403) {
+      throw new ApiConnectionError(message ?? '控制面会话已失效')
+    }
+    if (response.status >= 500) {
+      throw new ApiConnectionError(message ?? `控制面暂不可用 (${response.status})`)
+    }
+    throw new Error(message ?? `API request failed (${response.status})`)
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
 
-export async function loadConsoleSnapshot(): Promise<ConsoleSnapshot> {
+export async function loadConsoleSnapshot(signal?: AbortSignal): Promise<ConsoleSnapshot> {
   const [agents, systemState, contacts, groups, mentions, remarkRules, remarkTasks, entitlements, backups, audits] = await Promise.all([
-    request<ApiAgent[]>('/api/agents'),
-    request<ApiSystemState>('/api/system-state'),
-    request<ApiContact[]>('/api/contacts'),
-    request<ApiGroup[]>('/api/groups'),
-    request<ApiMention[]>('/api/group-mentions'),
-    request<ApiRemarkRule[]>('/api/remark-rules'),
-    request<ApiRemarkTask[]>('/api/remark-tasks'),
-    request<ApiEntitlement[]>('/api/entitlements'),
-    request<ApiBackup[]>('/api/backups'),
-    request<ApiAudit[]>('/api/audit-logs?take=100'),
+    request<ApiAgent[]>('/api/agents', { signal }),
+    request<ApiSystemState>('/api/system-state', { signal }),
+    request<ApiContact[]>('/api/contacts', { signal }),
+    request<ApiGroup[]>('/api/groups', { signal }),
+    request<ApiMention[]>('/api/group-mentions', { signal }),
+    request<ApiRemarkRule[]>('/api/remark-rules', { signal }),
+    request<ApiRemarkTask[]>('/api/remark-tasks', { signal }),
+    request<ApiEntitlement[]>('/api/entitlements', { signal }),
+    request<ApiBackup[]>('/api/backups', { signal }),
+    request<ApiAudit[]>('/api/audit-logs?take=100', { signal }),
   ])
   return { agents, systemState, contacts, groups, mentions, remarkRules, remarkTasks, entitlements, backups, audits }
 }
@@ -220,14 +250,15 @@ export async function activateTarget(input: {
   targetKind: 'contact' | 'group'
   packageCode: 'BASIC' | 'ADVANCED_GENERAL'
   duration: ApiEntitlement['duration']
-}) {
-  const issued = await request<{ code: string }>('/api/activation-codes', {
+}, operationKey: string) {
+  return request('/api/entitlements/activate', {
     method: 'POST',
-    body: JSON.stringify({ packageCode: input.packageCode, duration: input.duration }),
-  })
-  return request('/api/activation-codes/redeem', {
-    method: 'POST',
-    headers: { 'Idempotency-Key': idempotencyKey('activation') },
-    body: JSON.stringify({ code: issued.code, targetKind: input.targetKind, targetId: input.targetId }),
+    headers: { 'Idempotency-Key': operationKey },
+    body: JSON.stringify({
+      packageCode: input.packageCode,
+      duration: input.duration,
+      targetKind: input.targetKind,
+      targetId: input.targetId,
+    }),
   })
 }

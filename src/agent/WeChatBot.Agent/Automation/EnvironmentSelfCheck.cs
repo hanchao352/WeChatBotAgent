@@ -30,6 +30,11 @@ public interface IDesktopSessionProbe
     bool IsInputDesktopAvailable();
 }
 
+public interface IAgentRecoverySelfCheck
+{
+    EnvironmentSelfCheckReport Run(TimeSpan uiTimeout, CancellationToken cancellationToken);
+}
+
 public sealed class WindowsDesktopSessionProbe : IDesktopSessionProbe
 {
     private const uint DesktopSwitchDesktop = 0x0100;
@@ -79,10 +84,16 @@ public sealed class WindowsDesktopSessionProbe : IDesktopSessionProbe
 public sealed class EnvironmentSelfCheck(
     IDesktopSessionProbe desktopSession,
     IWeChatUiProbe uiProbe,
-    bool dryRun)
+    bool dryRun) : IAgentRecoverySelfCheck
 {
-    public EnvironmentSelfCheckReport Run(TimeSpan uiTimeout)
+    public EnvironmentSelfCheckReport Run(TimeSpan uiTimeout) =>
+        Run(uiTimeout, CancellationToken.None);
+
+    public EnvironmentSelfCheckReport Run(
+        TimeSpan uiTimeout,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var findings = new List<SelfCheckFinding>();
         Add("OS_WINDOWS", SelfCheckSeverity.Critical, desktopSession.IsWindows, "Agent requires Windows.");
         Add(
@@ -103,7 +114,9 @@ public sealed class EnvironmentSelfCheck(
                 ? "Dry-run is enabled; mutating commands cannot touch WeChat."
                 : "Dry-run is disabled, but this build still rejects all mutating commands.");
 
+        cancellationToken.ThrowIfCancellationRequested();
         var probe = uiProbe.Probe(uiTimeout);
+        cancellationToken.ThrowIfCancellationRequested();
         Add(probe.Code, SelfCheckSeverity.Critical, probe.IsSafe, probe.Summary);
 
         var ready = findings.All(finding => finding.Severity != SelfCheckSeverity.Critical || finding.Passed);

@@ -4,12 +4,13 @@ using Microsoft.Extensions.Configuration;
 
 namespace WeChatBot.Backend.Tests;
 
-public sealed class TestApplicationFactory : WebApplicationFactory<Program>
+public class TestApplicationFactory : WebApplicationFactory<Program>
 {
     public const string ApiKey = "test-api-key-with-more-than-thirty-two-characters";
     public const string AgentApiKey = "test-agent-api-key-with-more-than-thirty-two-characters";
     public static readonly Guid TenantId = Guid.Parse("22222222-2222-2222-2222-222222222222");
     private readonly string _root = Path.Combine(Path.GetTempPath(), "wechatbot-backend-tests", Guid.NewGuid().ToString("N"));
+    public string BackupDirectory => Path.Combine(_root, "backups");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -26,7 +27,7 @@ public sealed class TestApplicationFactory : WebApplicationFactory<Program>
                 ["Auth:ActorName"] = "integration-test-admin",
                 ["Activation:HashPepper"] = "integration-test-activation-pepper-32-characters-minimum",
                 ["Audit:IntegrityKey"] = "integration-test-audit-integrity-key-32-characters-minimum",
-                ["Backup:Directory"] = Path.Combine(_root, "backups"),
+                ["Backup:Directory"] = BackupDirectory,
                 ["Backup:EncryptionKeyBase64"] = Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData("integration-test-backup-key"u8.ToArray()))
             });
         });

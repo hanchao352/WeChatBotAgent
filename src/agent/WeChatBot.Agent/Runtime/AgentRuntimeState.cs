@@ -28,6 +28,7 @@ public sealed class AgentRuntimeState
 {
     private readonly Lock _sync = new();
     private int _activeExecutionPermits;
+    private bool _verifiedSelfCheckRequired;
     private AgentRuntimeSnapshot _snapshot = new(
         AgentOperatingState.Starting,
         "STARTING",
@@ -78,6 +79,7 @@ public sealed class AgentRuntimeState
                 return false;
             }
 
+            _verifiedSelfCheckRequired = false;
             _snapshot = _snapshot with
             {
                 State = AgentOperatingState.Healthy,
@@ -89,17 +91,39 @@ public sealed class AgentRuntimeState
         }
     }
 
-    public bool ResumeAfterControlPlaneAccepted(string reason, DateTimeOffset now)
+    public bool ResumeAfterControlPlaneDecision(
+        bool accepted,
+        bool emergencyStop,
+        string reason,
+        DateTimeOffset now)
     {
         if (string.IsNullOrWhiteSpace(reason))
         {
             throw new ArgumentException("A resume reason is required.", nameof(reason));
         }
 
+        if (!accepted || emergencyStop)
+        {
+            return false;
+        }
+
         lock (_sync)
         {
-            if (_snapshot.State != AgentOperatingState.PausedControlPlane)
+            if (_snapshot.State is not (
+                AgentOperatingState.PausedControlPlane or AgentOperatingState.PausedOperator))
             {
+                return false;
+            }
+
+            if (_verifiedSelfCheckRequired)
+            {
+                _snapshot = _snapshot with
+                {
+                    State = AgentOperatingState.PausedUnknownUi,
+                    ReasonCode = "UNKNOWN_UI_RECHECK_REQUIRED",
+                    Reason = "A controlled environment and UI self-check is required before execution can resume.",
+                    ChangedAt = now
+                };
                 return false;
             }
 
@@ -115,7 +139,12 @@ public sealed class AgentRuntimeState
     }
 
     public void PauseForUnknownUi(string reasonCode, string reason, DateTimeOffset now) =>
-        TransitionToPaused(AgentOperatingState.PausedUnknownUi, reasonCode, reason, now);
+        TransitionToPaused(
+            AgentOperatingState.PausedUnknownUi,
+            reasonCode,
+            reason,
+            now,
+            requireVerifiedSelfCheck: true);
 
     public void PauseForControlPlane(string reason, DateTimeOffset now) =>
         TransitionToPaused(AgentOperatingState.PausedControlPlane, "CONTROL_PLANE_UNAVAILABLE", reason, now);
@@ -172,7 +201,8 @@ public sealed class AgentRuntimeState
         AgentOperatingState state,
         string reasonCode,
         string reason,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        bool requireVerifiedSelfCheck = false)
     {
         if (string.IsNullOrWhiteSpace(reason))
         {
@@ -181,6 +211,11 @@ public sealed class AgentRuntimeState
 
         lock (_sync)
         {
+            if (requireVerifiedSelfCheck)
+            {
+                _verifiedSelfCheckRequired = true;
+            }
+
             if (_snapshot.State == AgentOperatingState.Stopping)
             {
                 return;

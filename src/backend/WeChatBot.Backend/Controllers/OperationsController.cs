@@ -54,7 +54,7 @@ public sealed class BackupsController(AppDbContext db, LogicalBackupService back
 [ApiController]
 [Authorize(Roles = "Admin")]
 [Route("api/audit-logs")]
-public sealed class AuditLogsController(AppDbContext db) : ControllerBase
+public sealed class AuditLogsController(AppDbContext db, AuditService audit) : ControllerBase
 {
     [HttpGet]
     public async Task<ActionResult<IReadOnlyList<AuditLog>>> List(
@@ -65,7 +65,14 @@ public sealed class AuditLogsController(AppDbContext db) : ControllerBase
         if (take is < 1 or > 500) throw DomainException.Validation("invalid_page_size", "take must be between 1 and 500.");
         var query = db.AuditLogs.AsNoTracking();
         if (!string.IsNullOrWhiteSpace(action)) query = query.Where(x => x.Action == action);
-        return Ok(await query.OrderByDescending(x => x.CreatedAt).Take(take).ToListAsync(cancellationToken));
+        var entries = await query.OrderByDescending(x => x.CreatedAt).Take(take).ToListAsync(cancellationToken);
+        if (entries.Any(x => !audit.HasValidIntegrity(x)))
+        {
+            throw DomainException.Conflict(
+                "audit_integrity_failed",
+                "One or more audit records failed integrity verification.");
+        }
+        return Ok(entries);
     }
 }
 

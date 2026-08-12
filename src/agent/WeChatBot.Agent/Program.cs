@@ -47,7 +47,7 @@ public static class Program
             return report.Ready ? 0 : 2;
         }
 
-        return await RunAgentAsync(options, uiProbe).ConfigureAwait(false);
+        return await RunAgentAsync(options, uiProbe, selfCheck).ConfigureAwait(false);
     }
 
     private static int RunDiagnostics(IWeChatProcessDetector processDetector, TimeSpan timeout)
@@ -74,7 +74,10 @@ public static class Program
         }
     }
 
-    private static async Task<int> RunAgentAsync(AgentOptions options, IWeChatUiProbe uiProbe)
+    private static async Task<int> RunAgentAsync(
+        AgentOptions options,
+        IWeChatUiProbe uiProbe,
+        IAgentRecoverySelfCheck recoverySelfCheck)
     {
         if (!WeChatInstanceLease.TryAcquire(options.WeChatInstanceId, out var acquiredLease))
         {
@@ -135,7 +138,9 @@ public static class Program
                 options.WeChatInstanceId,
                 options.DryRun,
                 options.HeartbeatInterval,
-                missedHeartbeatLimit: 4);
+                missedHeartbeatLimit: 4,
+                recoverySelfCheck: recoverySelfCheck,
+                recoverySelfCheckTimeout: options.UiProbeTimeout);
             heartbeatTask = pump.RunAsync(shutdown.Token);
         }
 

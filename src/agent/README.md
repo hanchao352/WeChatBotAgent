@@ -79,7 +79,22 @@ required; a version allow-list without them cannot pass the safety gate.
   and each binding has an isolated hashed SQLite WAL journal. Terminal entries
   use bounded retention and opportunistic batched pruning.
 - `AgentHeartbeatPump` reports only operational metadata and pauses the runtime
-  after repeated control-plane failures.
+  after repeated control-plane failures. A cleared emergency stop resumes an
+  operator pause only when the same heartbeat is accepted and explicitly says
+  `emergencyStop=false`. An unknown-UI pause remains closed until the full
+  controlled environment/UI self-check passes again.
+- An Agent credential may submit observed group events through
+  `POST /api/agents/{agentId}/group-mentions`; the server requires a recent
+  healthy dry-run heartbeat from the matching enabled Agent/WeChat binding.
+  The Agent cannot list stored messages or use the administrative message
+  endpoint.
+- Remote remark-task claiming and completion are intentionally not exposed to
+  Agent credentials in this baseline. `RemarkTask` does not yet contain a
+  claim owner, opaque lease token, lease expiry, attempt count, or result
+  deduplication identity. Those fields and an atomic claim/renew/complete
+  protocol must be added in a migration before multiple agents can safely
+  consume tasks. The existing administrative completion endpoint is not an
+  Agent execution protocol.
 
 No game package functionality is included.
 

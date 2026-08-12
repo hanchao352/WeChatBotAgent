@@ -113,6 +113,11 @@ public sealed class SerializedCommandExecutor : IAsyncDisposable
 
     public void Start()
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        if (_shutdown.IsCancellationRequested)
+        {
+            throw new InvalidOperationException("A stopped command executor cannot be restarted.");
+        }
         if (Interlocked.Exchange(ref _started, 1) != 0)
         {
             throw new InvalidOperationException("The command executor has already been started.");
@@ -129,6 +134,10 @@ public sealed class SerializedCommandExecutor : IAsyncDisposable
         if (Volatile.Read(ref _started) == 0)
         {
             throw new InvalidOperationException("Start the command executor before enqueueing commands.");
+        }
+        if (Volatile.Read(ref _disposed) != 0 || _shutdown.IsCancellationRequested)
+        {
+            throw new InvalidOperationException("The command executor is stopping and no longer accepts commands.");
         }
 
         var completion = new TaskCompletionSource<CommandExecutionResult>(

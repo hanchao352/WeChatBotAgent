@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using WeChatBot.Agent.Automation;
 using WeChatBot.Agent.Heartbeat;
 using WeChatBot.Agent.Runtime;
 using System.Text.Json;
@@ -112,6 +113,78 @@ public sealed class HeartbeatTests
     }
 
     [Fact]
+    public async Task ClearedEmergencyStopResumesOnlyAfterAcceptedHeartbeat()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var runtime = HealthyRuntime();
+        var responses = new Queue<AgentHeartbeatResponse>(
+        [
+            new(true, true, "config-1"),
+            new(false, false, "config-1"),
+            new(true, false, "config-1")
+        ]);
+        var observedStates = new List<AgentOperatingState>();
+        var client = new StubHeartbeatClient((_, _) =>
+        {
+            observedStates.Add(runtime.Snapshot().State);
+            var response = responses.Dequeue();
+            if (responses.Count == 0)
+            {
+                cancellation.Cancel();
+            }
+            return ValueTask.FromResult(response);
+        });
+        var pump = CreatePump(client, runtime, missedLimit: 3);
+
+        await pump.RunAsync(cancellation.Token);
+
+        Assert.Equal(
+            [AgentOperatingState.Healthy, AgentOperatingState.PausedOperator, AgentOperatingState.PausedOperator],
+            observedStates);
+        Assert.Equal(AgentOperatingState.Healthy, runtime.Snapshot().State);
+    }
+
+    [Fact]
+    public async Task UnknownUiPauseResumesOnlyAfterControlledSelfCheckPasses()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var runtime = HealthyRuntime();
+        runtime.PauseForUnknownUi("UNKNOWN", "unknown surface", DateTimeOffset.UtcNow);
+        var recovery = new StubRecoverySelfCheck(
+        [
+            CreateSelfCheckReport(ready: false),
+            CreateSelfCheckReport(ready: true)
+        ],
+        cancellation);
+        var client = new StubHeartbeatClient((_, _) =>
+            ValueTask.FromResult(new AgentHeartbeatResponse(true, false, "config-1")));
+        var pump = CreatePump(client, runtime, missedLimit: 3, recovery);
+
+        await pump.RunAsync(cancellation.Token);
+
+        Assert.Equal(2, recovery.Calls);
+        Assert.Equal(AgentOperatingState.Healthy, runtime.Snapshot().State);
+    }
+
+    [Fact]
+    public async Task UnknownUiPauseStaysClosedWhenNoRecoverySelfCheckIsConfigured()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var runtime = HealthyRuntime();
+        runtime.PauseForUnknownUi("UNKNOWN", "unknown surface", DateTimeOffset.UtcNow);
+        var client = new StubHeartbeatClient((_, _) =>
+        {
+            cancellation.Cancel();
+            return ValueTask.FromResult(new AgentHeartbeatResponse(true, false, "config-1"));
+        });
+        var pump = CreatePump(client, runtime, missedLimit: 3);
+
+        await pump.RunAsync(cancellation.Token);
+
+        Assert.Equal(AgentOperatingState.PausedUnknownUi, runtime.Snapshot().State);
+    }
+
+    [Fact]
     public async Task RepeatedHeartbeatFailuresPauseControlPlane()
     {
         using var cancellation = new CancellationTokenSource();
@@ -154,7 +227,8 @@ public sealed class HeartbeatTests
     private static AgentHeartbeatPump CreatePump(
         IAgentHeartbeatClient client,
         AgentRuntimeState runtime,
-        int missedLimit) =>
+        int missedLimit,
+        IAgentRecoverySelfCheck? recoverySelfCheck = null) =>
         new(
             client,
             runtime,
@@ -163,7 +237,26 @@ public sealed class HeartbeatTests
             "wechat-test",
             dryRun: true,
             TimeSpan.FromMilliseconds(10),
-            missedLimit);
+            missedLimit,
+            recoverySelfCheck: recoverySelfCheck,
+            recoverySelfCheckTimeout: TimeSpan.FromMilliseconds(50));
+
+    private static EnvironmentSelfCheckReport CreateSelfCheckReport(bool ready)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var probe = new UiProbeResult(
+            ready ? UiRecognitionStatus.CompatibleMainWindow : UiRecognitionStatus.UnknownSurface,
+            ready ? "WECHAT_UI_COMPATIBLE" : "WECHAT_SURFACE_UNKNOWN",
+            ready ? "compatible" : "unknown",
+            null,
+            null,
+            now);
+        return new EnvironmentSelfCheckReport(
+            now,
+            ready,
+            [new SelfCheckFinding(probe.Code, SelfCheckSeverity.Critical, ready, probe.Summary)],
+            probe);
+    }
 
     private static AgentHeartbeat CreateHeartbeat() =>
         new(
@@ -190,6 +283,33 @@ public sealed class HeartbeatTests
         public ValueTask<AgentHeartbeatResponse> SendAsync(
             AgentHeartbeat heartbeat,
             CancellationToken cancellationToken) => send(heartbeat, cancellationToken);
+    }
+
+    private sealed class StubRecoverySelfCheck(
+        Queue<EnvironmentSelfCheckReport> reports,
+        CancellationTokenSource cancellation) : IAgentRecoverySelfCheck
+    {
+        public StubRecoverySelfCheck(
+            IEnumerable<EnvironmentSelfCheckReport> reports,
+            CancellationTokenSource cancellation)
+            : this(new Queue<EnvironmentSelfCheckReport>(reports), cancellation)
+        {
+        }
+
+        public int Calls { get; private set; }
+
+        public EnvironmentSelfCheckReport Run(
+            TimeSpan uiTimeout,
+            CancellationToken cancellationToken)
+        {
+            Calls++;
+            var report = reports.Dequeue();
+            if (reports.Count == 0)
+            {
+                cancellation.Cancel();
+            }
+            return report;
+        }
     }
 
     private sealed class RecordingHttpHandler(

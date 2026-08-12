@@ -116,16 +116,38 @@ public sealed class EntitlementService(AppDbContext db, TimeProvider timeProvide
                 x.StartsAt <= instant &&
                 (x.EndsAt == null || x.EndsAt > instant))
             .Join(
-                db.ServicePackages.Where(x => x.IsEnabled),
+                db.ServicePackages,
                 entitlement => entitlement.PackageId,
                 package => package.Id,
-                (entitlement, package) => new { Entitlement = entitlement, package.FeaturesJson })
+                (entitlement, package) => new { Entitlement = entitlement, Package = package })
             .OrderByDescending(x => x.Entitlement.EndsAt == null)
             .ThenByDescending(x => x.Entitlement.EndsAt)
             .ToListAsync(cancellationToken);
-        return candidates
-            .FirstOrDefault(x => PackageFeatureSet.Contains(x.FeaturesJson, requiredFeature))
-            ?.Entitlement;
+        var matching = candidates
+            .Where(x =>
+                PackageFeatureSet.Contains(x.Package.FeaturesJson, requiredFeature) &&
+                (x.Package.Tier != PackageTier.AdvancedGeneral || targetKind == ServiceTargetKind.Group))
+            .ToList();
+        if (matching.Count == 0) return null;
+
+        var basicMatch = matching.FirstOrDefault(x => x.Package.Tier == PackageTier.Basic);
+        if (basicMatch is not null) return basicMatch.Entitlement;
+
+        var basicPackageIds = await db.ServicePackages.AsNoTracking()
+            .Where(x => x.Tier == PackageTier.Basic)
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken);
+        var hasActiveBasicDependency = await db.Entitlements.AsNoTracking().AnyAsync(x =>
+            x.TargetKind == targetKind &&
+            x.TargetId == targetId &&
+            basicPackageIds.Contains(x.PackageId) &&
+            x.State == EntitlementState.Active &&
+            x.StartsAt <= instant &&
+            (x.EndsAt == null || x.EndsAt > instant), cancellationToken);
+
+        return hasActiveBasicDependency
+            ? matching[0].Entitlement
+            : null;
     }
 }
 
@@ -137,6 +159,7 @@ public sealed class ActivationService(
     AuditService audit)
 {
     private const string RedeemOperation = "activation.redeem";
+    private const string DirectActivateOperation = "entitlement.activate";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public async Task<(ActivationCode Entity, string Plaintext)> IssueAsync(
@@ -187,6 +210,7 @@ public sealed class ActivationService(
         string idempotencyKey,
         CancellationToken cancellationToken)
     {
+        idempotencyKey = idempotencyKey?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128)
         {
             throw DomainException.Validation("invalid_idempotency_key", "Idempotency-Key is required and must be at most 128 characters.");
@@ -199,7 +223,8 @@ public sealed class ActivationService(
         {
             try
             {
-                var replay = await TryReadIdempotentResultAsync(idempotencyKey, requestHash, cancellationToken);
+                var replay = await TryReadIdempotentResultAsync(
+                    RedeemOperation, idempotencyKey, requestHash, cancellationToken);
                 if (replay is not null) return replay with { Replayed = true };
 
                 db.ChangeTracker.Clear();
@@ -235,6 +260,19 @@ public sealed class ActivationService(
                     throw DomainException.Conflict(
                         "service_package_disabled",
                         "The service package for this activation code is disabled; the activation code was not consumed.");
+                }
+                if (package.Tier == PackageTier.AdvancedGeneral && targetKind != ServiceTargetKind.Group)
+                {
+                    throw DomainException.Validation(
+                        "advanced_package_requires_group",
+                        "Advanced general service packages can only be activated for group targets.");
+                }
+                if (package.Tier == PackageTier.AdvancedGeneral &&
+                    !await HasActiveBasicDependencyAsync(targetKind, targetId, now, cancellationToken))
+                {
+                    throw DomainException.Conflict(
+                        "advanced_package_requires_basic",
+                        "An active basic service entitlement is required before activating an advanced service package.");
                 }
 
                 var startsAt = await ResolveEntitlementStartAsync(
@@ -305,7 +343,8 @@ public sealed class ActivationService(
                     Actor = tenant.Actor,
                     DetailsJson = JsonSerializer.Serialize(new { source = "activation-code", activationCodeId = activationCode.Id }, JsonOptions)
                 });
-                db.IdempotencyRecords.Add(CreateIdempotencyRecord(idempotencyKey, requestHash, result, now));
+                db.IdempotencyRecords.Add(CreateIdempotencyRecord(
+                    RedeemOperation, idempotencyKey, requestHash, result, now));
                 audit.Add("activation-code.redeemed", nameof(ActivationCode), activationCode.Id.ToString("D"), details: new
                 {
                     entitlementId,
@@ -331,13 +370,176 @@ public sealed class ActivationService(
         throw DomainException.Conflict("activation_busy", "Activation is temporarily busy. Retry with the same Idempotency-Key.");
     }
 
+    public async Task<RedemptionResult> ActivateForTargetAsync(
+        string packageCode,
+        ServiceDurationKind duration,
+        ServiceTargetKind targetKind,
+        Guid targetId,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        idempotencyKey = idempotencyKey?.Trim() ?? string.Empty;
+        packageCode = packageCode?.Trim().ToUpperInvariant() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128)
+        {
+            throw DomainException.Validation(
+                "invalid_idempotency_key",
+                "Idempotency-Key is required and must be at most 128 characters.");
+        }
+        _ = ServiceDurationCalculator.CalculateEnd(timeProvider.GetUtcNow(), duration);
+        var requestHash = StableHash.Sha256($"{packageCode}|{duration}|{targetKind}|{targetId:N}");
+
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            try
+            {
+                var replay = await TryReadIdempotentResultAsync(
+                    DirectActivateOperation, idempotencyKey, requestHash, cancellationToken);
+                if (replay is not null) return replay with { Replayed = true };
+
+                db.ChangeTracker.Clear();
+                await using var transaction = await db.Database.BeginTransactionAsync(
+                    IsolationLevel.Serializable, cancellationToken);
+                replay = await TryReadIdempotentResultAsync(
+                    DirectActivateOperation, idempotencyKey, requestHash, cancellationToken);
+                if (replay is not null)
+                {
+                    await transaction.RollbackAsync(cancellationToken);
+                    return replay with { Replayed = true };
+                }
+
+                var package = await db.ServicePackages.SingleOrDefaultAsync(
+                    x => x.Code == packageCode && x.IsEnabled, cancellationToken)
+                    ?? throw DomainException.NotFound("Service package");
+                await EnsureTargetExistsAsync(targetKind, targetId, cancellationToken);
+                var now = timeProvider.GetUtcNow();
+                await EnsurePackageTargetEligibleAsync(package, targetKind, targetId, now, cancellationToken);
+
+                var startsAt = await ResolveEntitlementStartAsync(
+                    targetKind, targetId, package.Id, now, cancellationToken);
+                var endsAt = ServiceDurationCalculator.CalculateEnd(startsAt, duration);
+                var entitlement = new Entitlement
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenant.TenantId,
+                    TargetKind = targetKind,
+                    TargetId = targetId,
+                    PackageId = package.Id,
+                    DurationKind = duration,
+                    StartsAt = startsAt,
+                    EndsAt = endsAt,
+                    State = EntitlementState.Active,
+                    Source = "admin-direct",
+                    CreatedAt = now
+                };
+                var result = new RedemptionResult(
+                    entitlement.Id,
+                    package.Code,
+                    duration,
+                    targetKind,
+                    targetId,
+                    startsAt,
+                    endsAt,
+                    startsAt > now ? "scheduled" : "active",
+                    false);
+
+                db.Entitlements.Add(entitlement);
+                db.EntitlementLedger.Add(new EntitlementLedger
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenant.TenantId,
+                    EntitlementId = entitlement.Id,
+                    EventType = startsAt > now ? "scheduled" : "activated",
+                    OccurredAt = now,
+                    Actor = tenant.Actor,
+                    DetailsJson = JsonSerializer.Serialize(new { source = "admin-direct" }, JsonOptions)
+                });
+                db.IdempotencyRecords.Add(CreateIdempotencyRecord(
+                    DirectActivateOperation, idempotencyKey, requestHash, result, now));
+                audit.Add("entitlement.activated", nameof(Entitlement), entitlement.Id.ToString("D"), details: new
+                {
+                    targetKind,
+                    targetId,
+                    package.Code,
+                    duration,
+                    startsAt,
+                    endsAt
+                });
+
+                await db.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                return result;
+            }
+            catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6 && attempt < 7)
+            {
+                db.ChangeTracker.Clear();
+                await Task.Delay(TimeSpan.FromMilliseconds(15 * (attempt + 1)), cancellationToken);
+            }
+            catch (DbUpdateException exception) when (
+                exception.InnerException is SqliteException { SqliteErrorCode: 19 } && attempt < 7)
+            {
+                db.ChangeTracker.Clear();
+                var winner = await TryReadIdempotentResultAsync(
+                    DirectActivateOperation, idempotencyKey, requestHash, cancellationToken);
+                if (winner is not null) return winner with { Replayed = true };
+                await Task.Delay(TimeSpan.FromMilliseconds(15 * (attempt + 1)), cancellationToken);
+            }
+        }
+
+        throw DomainException.Conflict(
+            "activation_busy",
+            "Service activation is temporarily busy. Retry with the same Idempotency-Key.");
+    }
+
+    private Task<bool> HasActiveBasicDependencyAsync(
+        ServiceTargetKind targetKind,
+        Guid targetId,
+        DateTimeOffset instant,
+        CancellationToken cancellationToken) =>
+        db.Entitlements.AsNoTracking()
+            .Where(x =>
+                x.TargetKind == targetKind &&
+                x.TargetId == targetId &&
+                x.State == EntitlementState.Active &&
+                x.StartsAt <= instant &&
+                (x.EndsAt == null || x.EndsAt > instant))
+            .Join(
+                db.ServicePackages.Where(x => x.Tier == PackageTier.Basic),
+                entitlement => entitlement.PackageId,
+                package => package.Id,
+                (_, _) => true)
+            .AnyAsync(cancellationToken);
+
+    private async Task EnsurePackageTargetEligibleAsync(
+        ServicePackage package,
+        ServiceTargetKind targetKind,
+        Guid targetId,
+        DateTimeOffset instant,
+        CancellationToken cancellationToken)
+    {
+        if (package.Tier != PackageTier.AdvancedGeneral) return;
+        if (targetKind != ServiceTargetKind.Group)
+        {
+            throw DomainException.Validation(
+                "advanced_package_requires_group",
+                "Advanced general service packages can only be activated for group targets.");
+        }
+        if (!await HasActiveBasicDependencyAsync(targetKind, targetId, instant, cancellationToken))
+        {
+            throw DomainException.Conflict(
+                "advanced_package_requires_basic",
+                "An active basic service entitlement is required before activating an advanced service package.");
+        }
+    }
+
     private async Task<RedemptionResult?> TryReadIdempotentResultAsync(
+        string operation,
         string key,
         string requestHash,
         CancellationToken cancellationToken)
     {
         var record = await db.IdempotencyRecords.AsNoTracking()
-            .SingleOrDefaultAsync(x => x.Operation == RedeemOperation && x.Key == key, cancellationToken);
+            .SingleOrDefaultAsync(x => x.Operation == operation && x.Key == key, cancellationToken);
         if (record is null) return null;
         if (!CryptographicOperations.FixedTimeEquals(
                 Convert.FromHexString(record.RequestHash),
@@ -359,7 +561,8 @@ public sealed class ActivationService(
         CancellationToken cancellationToken)
     {
         db.ChangeTracker.Clear();
-        var idempotent = await TryReadIdempotentResultAsync(idempotencyKey, requestHash, cancellationToken);
+        var idempotent = await TryReadIdempotentResultAsync(
+            RedeemOperation, idempotencyKey, requestHash, cancellationToken);
         if (idempotent is not null) return idempotent with { Replayed = true };
 
         if (code.RedeemedTargetKind != targetKind || code.RedeemedTargetId != targetId || code.EntitlementId is null)
@@ -382,7 +585,8 @@ public sealed class ActivationService(
             EntitlementEvaluator.EffectiveStatus(entitlement, timeProvider.GetUtcNow()),
             true);
         var now = timeProvider.GetUtcNow();
-        db.IdempotencyRecords.Add(CreateIdempotencyRecord(idempotencyKey, requestHash, result, now));
+        db.IdempotencyRecords.Add(CreateIdempotencyRecord(
+            RedeemOperation, idempotencyKey, requestHash, result, now));
         try
         {
             await db.SaveChangesAsync(cancellationToken);
@@ -390,7 +594,8 @@ public sealed class ActivationService(
         catch (DbUpdateException)
         {
             db.ChangeTracker.Clear();
-            var winner = await TryReadIdempotentResultAsync(idempotencyKey, requestHash, cancellationToken);
+            var winner = await TryReadIdempotentResultAsync(
+                RedeemOperation, idempotencyKey, requestHash, cancellationToken);
             if (winner is null) throw;
             return winner with { Replayed = true };
         }
@@ -398,6 +603,7 @@ public sealed class ActivationService(
     }
 
     private IdempotencyRecord CreateIdempotencyRecord(
+        string operation,
         string key,
         string requestHash,
         RedemptionResult response,
@@ -405,7 +611,7 @@ public sealed class ActivationService(
         {
             Id = Guid.NewGuid(),
             TenantId = tenant.TenantId,
-            Operation = RedeemOperation,
+            Operation = operation,
             Key = key,
             RequestHash = requestHash,
             StatusCode = StatusCodes.Status200OK,

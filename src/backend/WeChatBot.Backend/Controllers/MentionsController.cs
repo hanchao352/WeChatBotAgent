@@ -19,16 +19,17 @@ public sealed record GroupMentionResponse(
     bool Duplicate);
 
 [ApiController]
-[Authorize(Roles = "Admin")]
 [Route("api/group-mentions")]
 public sealed class MentionsController(
     AppDbContext db,
     TenantContext tenant,
     TimeProvider timeProvider,
     EntitlementService entitlements,
+    AgentControlService agents,
     AuditService audit) : ControllerBase
 {
     [HttpGet]
+    [Authorize(Roles = "Admin")]
     public async Task<ActionResult<IReadOnlyList<GroupMentionEvent>>> List(
         [FromQuery] Guid? groupId,
         [FromQuery] int take = 100,
@@ -41,11 +42,40 @@ public sealed class MentionsController(
     }
 
     [HttpPost]
-    public async Task<ActionResult<GroupMentionResponse>> Ingest(GroupMentionRequest request, CancellationToken cancellationToken)
+    [Authorize(Roles = "Admin")]
+    public Task<ActionResult<GroupMentionResponse>> Ingest(
+        GroupMentionRequest request,
+        CancellationToken cancellationToken) =>
+        IngestCore(request, cancellationToken);
+
+    [HttpPost("/api/agents/{agentId}/group-mentions")]
+    [Authorize(Roles = "Agent")]
+    public Task<ActionResult<GroupMentionResponse>> IngestFromAgent(
+        string agentId,
+        AgentGroupMentionRequest request,
+        CancellationToken cancellationToken) =>
+        IngestFromAgentCore(agentId, request, cancellationToken);
+
+    private async Task<ActionResult<GroupMentionResponse>> IngestFromAgentCore(
+        string agentId,
+        AgentGroupMentionRequest request,
+        CancellationToken cancellationToken)
+    {
+        await agents.EnsureActiveBindingAsync(
+            agentId,
+            request.WeChatInstanceId,
+            cancellationToken);
+        return await IngestCore(request.Event, cancellationToken);
+    }
+
+    private async Task<ActionResult<GroupMentionResponse>> IngestCore(
+        GroupMentionRequest request,
+        CancellationToken cancellationToken)
     {
         if (request.GroupId == Guid.Empty) throw DomainException.Validation("group_required", "GroupId is required.");
+        var externalEventId = request.ExternalEventId.Trim();
         var existing = await db.GroupMentions.AsNoTracking()
-            .SingleOrDefaultAsync(x => x.ExternalEventId == request.ExternalEventId, cancellationToken);
+            .SingleOrDefaultAsync(x => x.ExternalEventId == externalEventId, cancellationToken);
         if (existing is not null) return Ok(ToResponse(ValidateDuplicate(existing, request), true));
 
         var now = timeProvider.GetUtcNow();
@@ -59,7 +89,7 @@ public sealed class MentionsController(
         {
             Id = Guid.NewGuid(),
             TenantId = tenant.TenantId,
-            ExternalEventId = request.ExternalEventId.Trim(),
+            ExternalEventId = externalEventId,
             GroupId = request.GroupId,
             SenderExternalId = request.SenderExternalId.Trim(),
             Content = request.Content,
@@ -92,7 +122,7 @@ public sealed class MentionsController(
         {
             db.ChangeTracker.Clear();
             existing = await db.GroupMentions.AsNoTracking()
-                .SingleOrDefaultAsync(x => x.ExternalEventId == request.ExternalEventId, cancellationToken);
+                .SingleOrDefaultAsync(x => x.ExternalEventId == externalEventId, cancellationToken);
             if (existing is null) throw;
             return Ok(ToResponse(ValidateDuplicate(existing, request), true));
         }
@@ -101,6 +131,7 @@ public sealed class MentionsController(
     }
 
     [HttpGet("{id:guid}")]
+    [Authorize(Roles = "Admin")]
     public async Task<ActionResult<GroupMentionEvent>> Get(Guid id, CancellationToken cancellationToken) =>
         await db.GroupMentions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, cancellationToken)
         ?? throw DomainException.NotFound("Group mention event");
