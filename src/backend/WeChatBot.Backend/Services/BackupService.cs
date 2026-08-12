@@ -1,0 +1,535 @@
+using System.Data;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using WeChatBot.Backend.Data;
+using WeChatBot.Backend.Domain;
+using WeChatBot.Backend.Infrastructure;
+
+namespace WeChatBot.Backend.Services;
+
+public sealed class BackupOptions
+{
+    public string Directory { get; set; } = "data/backups";
+    public string EncryptionKeyBase64 { get; set; } = string.Empty;
+}
+
+public sealed record BackupVerification(Guid BackupId, bool IsValid, string ExpectedSha256, string ActualSha256, long Bytes);
+
+public sealed record RestoreResult(
+    Guid RestoreId,
+    Guid BackupId,
+    Guid PreRestoreBackupId,
+    IReadOnlyDictionary<string, int> Restored,
+    string Mode,
+    bool IsolatedEnvironmentCreated,
+    bool AutomationPaused,
+    bool Replayed);
+
+internal sealed class LogicalBackupPayload
+{
+    public const int CurrentSchemaVersion = 2;
+    public const int MinimumSupportedSchemaVersion = 1;
+    public int SchemaVersion { get; set; } = CurrentSchemaVersion;
+    public Guid TenantId { get; set; }
+    public DateTimeOffset ExportedAt { get; set; }
+    public TenantState? Tenant { get; set; }
+    public List<AgentRegistration> AgentRegistrations { get; set; } = [];
+    public List<Contact> Contacts { get; set; } = [];
+    public List<GroupChat> Groups { get; set; } = [];
+    public List<RemarkRule> RemarkRules { get; set; } = [];
+    public List<RemarkTask> RemarkTasks { get; set; } = [];
+    public List<GroupMentionEvent> GroupMentions { get; set; } = [];
+    public List<Entitlement> Entitlements { get; set; } = [];
+    public List<EntitlementLedger> EntitlementLedger { get; set; } = [];
+    public List<ActivationCode> ActivationCodes { get; set; } = [];
+    public List<AuditLog> AuditLogs { get; set; } = [];
+}
+
+public sealed class LogicalBackupService(
+    AppDbContext db,
+    TenantContext tenant,
+    TimeProvider timeProvider,
+    IOptions<BackupOptions> options,
+    AuditService audit)
+{
+    private static readonly byte[] Magic = "WXB1"u8.ToArray();
+    private static readonly SemaphoreSlim RestoreGate = new(1, 1);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+    };
+
+    public async Task<BackupManifest> CreateAsync(string reason, CancellationToken cancellationToken)
+    {
+        var now = timeProvider.GetUtcNow();
+        LogicalBackupPayload payload;
+        await using (var snapshot = await db.Database.BeginTransactionAsync(
+                         IsolationLevel.Serializable,
+                         cancellationToken))
+        {
+            payload = new LogicalBackupPayload
+            {
+                TenantId = tenant.TenantId,
+                ExportedAt = now,
+                Tenant = await db.Tenants.AsNoTracking().SingleOrDefaultAsync(cancellationToken),
+                AgentRegistrations = await db.AgentRegistrations.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                Contacts = await db.Contacts.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                Groups = await db.Groups.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                RemarkRules = await db.RemarkRules.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                RemarkTasks = await db.RemarkTasks.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                GroupMentions = await db.GroupMentions.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                Entitlements = await db.Entitlements.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                EntitlementLedger = await db.EntitlementLedger.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                ActivationCodes = await db.ActivationCodes.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                AuditLogs = await db.AuditLogs.AsNoTracking().OrderBy(x => x.CreatedAt).ThenBy(x => x.Id).ToListAsync(cancellationToken)
+            };
+            await snapshot.CommitAsync(cancellationToken);
+        }
+
+        var plaintext = JsonSerializer.SerializeToUtf8Bytes(payload, JsonOptions);
+        var encrypted = Encrypt(plaintext, GetEncryptionKey());
+        var backupId = Guid.NewGuid();
+        var fileName = $"{tenant.TenantId:N}-{now:yyyyMMddHHmmss}-{backupId:N}.wxbak";
+        var path = ResolvePath(fileName);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+        {
+            await stream.WriteAsync(encrypted, cancellationToken);
+            await stream.FlushAsync(cancellationToken);
+        }
+
+        var counts = CalculateCounts(payload);
+        var manifest = new BackupManifest
+        {
+            Id = backupId,
+            TenantId = tenant.TenantId,
+            CreatedAt = now,
+            CreatedBy = tenant.Actor,
+            FileName = fileName,
+            PayloadSha256 = StableHash.Sha256(encrypted),
+            Bytes = encrypted.LongLength,
+            SchemaVersion = payload.SchemaVersion,
+            CountsJson = JsonSerializer.Serialize(counts, JsonOptions),
+            Status = BackupStatus.Created
+        };
+        db.BackupManifests.Add(manifest);
+        audit.Add("backup.created", nameof(BackupManifest), manifest.Id.ToString("D"), details: new
+        {
+            manifest.SchemaVersion,
+            manifest.Bytes,
+            reason,
+            counts
+        });
+        await db.SaveChangesAsync(cancellationToken);
+        return manifest;
+    }
+
+    public async Task<BackupVerification> VerifyAsync(Guid backupId, CancellationToken cancellationToken)
+    {
+        var manifest = await db.BackupManifests.SingleOrDefaultAsync(x => x.Id == backupId, cancellationToken)
+                       ?? throw DomainException.NotFound("Backup manifest");
+        var bytes = await ReadBackupAsync(manifest, cancellationToken);
+        var actual = StableHash.Sha256(bytes);
+        var valid = HashEquals(manifest.PayloadSha256, actual);
+        if (valid)
+        {
+            try
+            {
+                var plaintext = Decrypt(bytes, GetEncryptionKey());
+                var payload = JsonSerializer.Deserialize<LogicalBackupPayload>(plaintext, JsonOptions);
+                var expectedCounts = JsonSerializer.Deserialize<Dictionary<string, int>>(manifest.CountsJson, JsonOptions);
+                valid = payload is not null &&
+                        IsSupportedSchema(payload.SchemaVersion) &&
+                        payload.SchemaVersion == manifest.SchemaVersion &&
+                        payload.TenantId == tenant.TenantId &&
+                        expectedCounts is not null &&
+                        CountsEqual(expectedCounts, CalculateCounts(payload));
+            }
+            catch (CryptographicException)
+            {
+                valid = false;
+            }
+            catch (JsonException)
+            {
+                valid = false;
+            }
+        }
+
+        manifest.Status = valid ? BackupStatus.Verified : BackupStatus.Corrupt;
+        manifest.VerifiedAt = timeProvider.GetUtcNow();
+        audit.Add("backup.verified", nameof(BackupManifest), manifest.Id.ToString("D"), valid, new { valid, actual });
+        await db.SaveChangesAsync(cancellationToken);
+        return new BackupVerification(manifest.Id, valid, manifest.PayloadSha256, actual, bytes.LongLength);
+    }
+
+    public async Task<RestoreResult> RestoreAsync(
+        Guid backupId,
+        string confirmation,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        await RestoreGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await RestoreCoreAsync(backupId, confirmation, idempotencyKey, cancellationToken);
+        }
+        finally
+        {
+            RestoreGate.Release();
+        }
+    }
+
+    private async Task<RestoreResult> RestoreCoreAsync(
+        Guid backupId,
+        string confirmation,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(confirmation, "RESTORE", StringComparison.Ordinal))
+            throw DomainException.Validation("restore_confirmation_required", "Set confirmation to RESTORE to perform a logical restore.");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128)
+            throw DomainException.Validation("invalid_idempotency_key", "Idempotency-Key is required and must be at most 128 characters.");
+
+        var existingRestore = await db.RestoreOperations.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey, cancellationToken);
+        if (existingRestore is not null)
+        {
+            if (existingRestore.BackupManifestId != backupId)
+                throw DomainException.Conflict("idempotency_key_reused", "The Idempotency-Key was already used for another backup.");
+            var stored = JsonSerializer.Deserialize<RestoreResult>(existingRestore.ReportJson, JsonOptions)
+                         ?? throw new InvalidOperationException("Stored restore report is invalid.");
+            return stored with { Replayed = true };
+        }
+
+        var manifest = await db.BackupManifests.AsNoTracking().SingleOrDefaultAsync(x => x.Id == backupId, cancellationToken)
+                       ?? throw DomainException.NotFound("Backup manifest");
+        var bytes = await ReadBackupAsync(manifest, cancellationToken);
+        var actualHash = StableHash.Sha256(bytes);
+        if (!HashEquals(manifest.PayloadSha256, actualHash))
+            throw DomainException.Conflict("backup_checksum_failed", "Backup checksum verification failed; restore was not started.");
+
+        LogicalBackupPayload payload;
+        Dictionary<string, int> manifestCounts;
+        try
+        {
+            payload = JsonSerializer.Deserialize<LogicalBackupPayload>(Decrypt(bytes, GetEncryptionKey()), JsonOptions)
+                      ?? throw new JsonException("Backup payload is empty.");
+            manifestCounts = JsonSerializer.Deserialize<Dictionary<string, int>>(manifest.CountsJson, JsonOptions)
+                             ?? throw new JsonException("Backup manifest counts are empty.");
+        }
+        catch (Exception exception) when (exception is CryptographicException or JsonException)
+        {
+            throw DomainException.Conflict("backup_payload_invalid", "Backup decryption or payload validation failed; restore was not started.");
+        }
+        if (!IsSupportedSchema(payload.SchemaVersion) ||
+            payload.SchemaVersion != manifest.SchemaVersion ||
+            payload.TenantId != tenant.TenantId)
+            throw DomainException.Conflict("backup_schema_mismatch", "Backup schema or tenant does not match the restore target.");
+        if (!CountsEqual(manifestCounts, CalculateCounts(payload)))
+            throw DomainException.Conflict("backup_manifest_mismatch", "Backup record counts do not match the manifest.");
+
+        var preRestore = await CreateAsync("automatic-pre-restore", cancellationToken);
+        db.ChangeTracker.Clear();
+        var startedAt = timeProvider.GetUtcNow();
+        var restored = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        var tenantState = await db.Tenants.SingleAsync(cancellationToken);
+        if (payload.Tenant is not null)
+        {
+            tenantState.Name = payload.Tenant.Name;
+        }
+        tenantState.AutomationPaused = true;
+        tenantState.UpdatedAt = startedAt;
+        tenantState.Version++;
+
+        restored["agentRegistrations"] = await RestoreAgentRegistrationsAsync(payload.AgentRegistrations, cancellationToken);
+        restored["contacts"] = await RestoreContactsAsync(payload.Contacts, cancellationToken);
+        restored["groups"] = await RestoreGroupsAsync(payload.Groups, cancellationToken);
+        restored["remarkRules"] = await RestoreRemarkRulesAsync(payload.RemarkRules, cancellationToken);
+        restored["remarkTasks"] = await AddMissingAsync(db.RemarkTasks, payload.RemarkTasks, x => x.Id, cancellationToken);
+        restored["entitlements"] = await AddMissingAsync(db.Entitlements, payload.Entitlements, x => x.Id, cancellationToken);
+        restored["activationCodes"] = await AddMissingAsync(db.ActivationCodes, payload.ActivationCodes, x => x.Id, cancellationToken);
+        restored["entitlementLedger"] = await AddMissingAsync(db.EntitlementLedger, payload.EntitlementLedger, x => x.Id, cancellationToken);
+        restored["groupMentions"] = await AddMissingAsync(db.GroupMentions, payload.GroupMentions, x => x.Id, cancellationToken);
+        restored["auditLogs"] = await AddMissingAsync(db.AuditLogs, payload.AuditLogs, x => x.Id, cancellationToken);
+
+        // Existing entitlement, redemption and ledger rows are authoritative and are never overwritten by an older snapshot.
+        var restoreId = Guid.NewGuid();
+        var completedAt = timeProvider.GetUtcNow();
+        var result = new RestoreResult(
+            restoreId,
+            backupId,
+            preRestore.Id,
+            restored,
+            "in-place-merge",
+            false,
+            true,
+            false);
+        var reportJson = JsonSerializer.Serialize(result, JsonOptions);
+        db.RestoreOperations.Add(new RestoreOperation
+        {
+            Id = restoreId,
+            TenantId = tenant.TenantId,
+            BackupManifestId = backupId,
+            PreRestoreBackupManifestId = preRestore.Id,
+            IdempotencyKey = idempotencyKey,
+            Actor = tenant.Actor,
+            StartedAt = startedAt,
+            CompletedAt = completedAt,
+            Status = "completed",
+            ReportJson = reportJson
+        });
+        audit.Add("backup.restored", nameof(BackupManifest), backupId.ToString("D"), details: new
+        {
+            restoreId,
+            preRestoreBackupId = preRestore.Id,
+            restored,
+            automationPaused = true,
+            mergeOnly = true,
+            authoritativeFactsPreserved = true
+        });
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return result;
+    }
+
+    private async Task<int> RestoreContactsAsync(List<Contact> source, CancellationToken cancellationToken)
+    {
+        var existing = await db.Contacts.ToDictionaryAsync(x => x.Id, cancellationToken);
+        var count = 0;
+        foreach (var item in source.Where(x => x.TenantId == tenant.TenantId))
+        {
+            if (existing.TryGetValue(item.Id, out var target))
+            {
+                target.ExternalId = item.ExternalId;
+                target.DisplayName = item.DisplayName;
+                target.WeChatId = item.WeChatId;
+                target.CustomerCode = item.CustomerCode;
+                target.SystemRemark = item.SystemRemark;
+                target.CurrentWeChatRemark = item.CurrentWeChatRemark;
+                target.ManualRemarkProtected = item.ManualRemarkProtected;
+                target.ServiceExpiresAt = item.ServiceExpiresAt;
+                target.UpdatedAt = timeProvider.GetUtcNow();
+                target.Version++;
+            }
+            else
+            {
+                db.Contacts.Add(item);
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private async Task<int> RestoreAgentRegistrationsAsync(
+        List<AgentRegistration> source,
+        CancellationToken cancellationToken)
+    {
+        var existing = await db.AgentRegistrations.AsNoTracking().ToListAsync(cancellationToken);
+        var existingIds = existing.Select(x => x.Id).ToHashSet();
+        var existingAgentIds = existing.Select(x => x.NormalizedAgentId).ToHashSet(StringComparer.Ordinal);
+        var restored = 0;
+
+        foreach (var item in source.Where(x => x.TenantId == tenant.TenantId))
+        {
+            var normalizedAgentId = AgentControlService.NormalizeAgentId(item.AgentId);
+            if (string.IsNullOrWhiteSpace(normalizedAgentId) ||
+                string.IsNullOrWhiteSpace(item.WeChatInstanceId) ||
+                existingIds.Contains(item.Id) ||
+                existingAgentIds.Contains(normalizedAgentId))
+            {
+                continue;
+            }
+
+            item.AgentId = item.AgentId.Trim();
+            item.NormalizedAgentId = normalizedAgentId;
+            item.WeChatInstanceId = item.WeChatInstanceId.Trim();
+            item.ConfigurationVersion = string.IsNullOrWhiteSpace(item.ConfigurationVersion)
+                ? "1"
+                : item.ConfigurationVersion.Trim();
+            db.AgentRegistrations.Add(item);
+            existingIds.Add(item.Id);
+            existingAgentIds.Add(normalizedAgentId);
+            restored++;
+        }
+
+        return restored;
+    }
+
+    private async Task<int> RestoreGroupsAsync(List<GroupChat> source, CancellationToken cancellationToken)
+    {
+        var existing = await db.Groups.ToDictionaryAsync(x => x.Id, cancellationToken);
+        var count = 0;
+        foreach (var item in source.Where(x => x.TenantId == tenant.TenantId))
+        {
+            if (existing.TryGetValue(item.Id, out var target))
+            {
+                target.ExternalId = item.ExternalId;
+                target.DisplayName = item.DisplayName;
+                target.BusinessName = item.BusinessName;
+                target.SystemRemark = item.SystemRemark;
+                target.CurrentWeChatRemark = item.CurrentWeChatRemark;
+                target.ManualRemarkProtected = item.ManualRemarkProtected;
+                target.ServiceExpiresAt = item.ServiceExpiresAt;
+                target.UpdatedAt = timeProvider.GetUtcNow();
+                target.Version++;
+            }
+            else
+            {
+                db.Groups.Add(item);
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private async Task<int> RestoreRemarkRulesAsync(List<RemarkRule> source, CancellationToken cancellationToken)
+    {
+        var existing = await db.RemarkRules.ToDictionaryAsync(x => x.Id, cancellationToken);
+        var count = 0;
+        foreach (var item in source.Where(x => x.TenantId == tenant.TenantId))
+        {
+            if (existing.TryGetValue(item.Id, out var target))
+            {
+                target.Name = item.Name;
+                target.TargetKind = item.TargetKind;
+                target.Template = item.Template;
+                target.ConflictPolicy = item.ConflictPolicy;
+                target.IsEnabled = item.IsEnabled;
+                target.MaxLength = item.MaxLength;
+                target.UpdatedAt = timeProvider.GetUtcNow();
+                target.Version++;
+            }
+            else
+            {
+                db.RemarkRules.Add(item);
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private async Task<int> AddMissingAsync<TEntity>(
+        DbSet<TEntity> set,
+        IEnumerable<TEntity> source,
+        Func<TEntity, Guid> keySelector,
+        CancellationToken cancellationToken) where TEntity : class, ITenantEntity
+    {
+        var currentIds = await set.AsNoTracking().Select(x => EF.Property<Guid>(x, "Id")).ToHashSetAsync(cancellationToken);
+        var missing = source
+            .Where(x => x.TenantId == tenant.TenantId && !currentIds.Contains(keySelector(x)))
+            .ToList();
+        if (missing.Count > 0) await set.AddRangeAsync(missing, cancellationToken);
+        return missing.Count;
+    }
+
+    private async Task<byte[]> ReadBackupAsync(BackupManifest manifest, CancellationToken cancellationToken)
+    {
+        var path = ResolvePath(manifest.FileName);
+        if (!File.Exists(path)) throw DomainException.NotFound("Backup payload");
+        return await File.ReadAllBytesAsync(path, cancellationToken);
+    }
+
+    private string ResolvePath(string fileName)
+    {
+        if (!string.Equals(fileName, Path.GetFileName(fileName), StringComparison.Ordinal))
+            throw new InvalidOperationException("Backup manifest contains an invalid file name.");
+        var root = Path.GetFullPath(options.Value.Directory);
+        var resolved = Path.GetFullPath(Path.Combine(root, fileName));
+        var rootPrefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!resolved.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Backup path escaped the configured backup directory.");
+        return resolved;
+    }
+
+    private byte[] GetEncryptionKey()
+    {
+        try
+        {
+            var key = Convert.FromBase64String(options.Value.EncryptionKeyBase64);
+            if (key.Length != 32) throw new FormatException();
+            return key;
+        }
+        catch (FormatException)
+        {
+            throw new InvalidOperationException("Backup encryption key must be a base64-encoded 32-byte key.");
+        }
+    }
+
+    private static byte[] Encrypt(byte[] plaintext, byte[] key)
+    {
+        var nonce = RandomNumberGenerator.GetBytes(12);
+        var tag = new byte[16];
+        var ciphertext = new byte[plaintext.Length];
+        using var aes = new AesGcm(key, tag.Length);
+        aes.Encrypt(nonce, plaintext, ciphertext, tag, Magic);
+        var output = new byte[Magic.Length + nonce.Length + tag.Length + ciphertext.Length];
+        Magic.CopyTo(output, 0);
+        nonce.CopyTo(output, Magic.Length);
+        tag.CopyTo(output, Magic.Length + nonce.Length);
+        ciphertext.CopyTo(output, Magic.Length + nonce.Length + tag.Length);
+        return output;
+    }
+
+    private static byte[] Decrypt(byte[] encrypted, byte[] key)
+    {
+        const int nonceLength = 12;
+        const int tagLength = 16;
+        if (encrypted.Length < Magic.Length + nonceLength + tagLength ||
+            !encrypted.AsSpan(0, Magic.Length).SequenceEqual(Magic))
+            throw new CryptographicException("Invalid backup envelope.");
+        var nonce = encrypted.AsSpan(Magic.Length, nonceLength);
+        var tag = encrypted.AsSpan(Magic.Length + nonceLength, tagLength);
+        var ciphertext = encrypted.AsSpan(Magic.Length + nonceLength + tagLength);
+        var plaintext = new byte[ciphertext.Length];
+        using var aes = new AesGcm(key, tagLength);
+        aes.Decrypt(nonce, ciphertext, tag, plaintext, Magic);
+        return plaintext;
+    }
+
+    private static bool HashEquals(string expected, string actual)
+    {
+        try
+        {
+            return CryptographicOperations.FixedTimeEquals(Convert.FromHexString(expected), Convert.FromHexString(actual));
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    private static Dictionary<string, int> CalculateCounts(LogicalBackupPayload payload)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal)
+        {
+            ["contacts"] = payload.Contacts.Count,
+            ["groups"] = payload.Groups.Count,
+            ["remarkRules"] = payload.RemarkRules.Count,
+            ["remarkTasks"] = payload.RemarkTasks.Count,
+            ["groupMentions"] = payload.GroupMentions.Count,
+            ["entitlements"] = payload.Entitlements.Count,
+            ["entitlementLedger"] = payload.EntitlementLedger.Count,
+            ["activationCodes"] = payload.ActivationCodes.Count,
+            ["auditLogs"] = payload.AuditLogs.Count
+        };
+        if (payload.SchemaVersion >= 2)
+        {
+            counts["agentRegistrations"] = payload.AgentRegistrations.Count;
+        }
+        return counts;
+    }
+
+    private static bool IsSupportedSchema(int schemaVersion) =>
+        schemaVersion is >= LogicalBackupPayload.MinimumSupportedSchemaVersion and <= LogicalBackupPayload.CurrentSchemaVersion;
+
+    private static bool CountsEqual(
+        IReadOnlyDictionary<string, int> expected,
+        IReadOnlyDictionary<string, int> actual) =>
+        expected.Count == actual.Count && expected.All(pair => actual.TryGetValue(pair.Key, out var value) && value == pair.Value);
+}

@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/agent/">
+    <Project Path="src/agent/WeChatBot.Agent/WeChatBot.Agent.csproj" />
+  </Folder>
+  <Folder Name="/src/backend/">
+    <Project Path="src/backend/WeChatBot.Backend/WeChatBot.Backend.csproj" />
+  </Folder>
+  <Folder Name="/tests/" />
+  <Folder Name="/tests/agent/">
+    <Project Path="tests/agent/WeChatBot.Agent.Tests/WeChatBot.Agent.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/backend/">
+    <Project Path="tests/backend/WeChatBot.Backend.Tests/WeChatBot.Backend.Tests.csproj" />
+  </Folder>
+</Solution>

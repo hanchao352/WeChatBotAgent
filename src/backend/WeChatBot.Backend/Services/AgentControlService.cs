@@ -1,0 +1,236 @@
+using Microsoft.EntityFrameworkCore;
+using WeChatBot.Backend.Contracts;
+using WeChatBot.Backend.Data;
+using WeChatBot.Backend.Domain;
+using WeChatBot.Backend.Infrastructure;
+
+namespace WeChatBot.Backend.Services;
+
+public sealed class AgentControlService(
+    AppDbContext db,
+    TenantContext tenant,
+    TimeProvider timeProvider,
+    AuditService audit)
+{
+    private static readonly TimeSpan MaximumClockSkew = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan OnlineWindow = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan RejectionAuditInterval = TimeSpan.FromMinutes(5);
+
+    public async Task<AgentHeartbeatResponse> RecordHeartbeatAsync(
+        AgentHeartbeatRequest request,
+        CancellationToken cancellationToken)
+    {
+        var now = timeProvider.GetUtcNow();
+        ValidateTimestamps(request, now);
+
+        var agentId = request.AgentId.Trim();
+        var normalizedAgentId = NormalizeAgentId(agentId);
+        var weChatInstanceId = request.WeChatInstanceId.Trim();
+        var registration = await EnsureRegistrationAsync(
+            agentId,
+            normalizedAgentId,
+            weChatInstanceId,
+            now,
+            cancellationToken);
+
+        var emergencyStop = await db.Tenants.AsNoTracking()
+            .Select(x => x.AutomationPaused)
+            .SingleAsync(cancellationToken);
+        var identityMatches = string.Equals(
+            registration.WeChatInstanceId,
+            weChatInstanceId,
+            StringComparison.Ordinal);
+
+        if (!identityMatches)
+        {
+            var state = await db.AgentHeartbeatStates
+                .SingleOrDefaultAsync(x => x.AgentRegistrationId == registration.Id, cancellationToken);
+            var auditRejection = state?.LastRejectedAt is null ||
+                                 now - state.LastRejectedAt.Value >= RejectionAuditInterval;
+            if (auditRejection)
+            {
+                if (state is not null)
+                {
+                    state.LastRejectedAt = now;
+                    state.LastRejectedWeChatInstanceId = weChatInstanceId;
+                    state.Version++;
+                }
+                audit.Add(
+                    "agent.heartbeat.binding_rejected",
+                    nameof(AgentRegistration),
+                    registration.Id.ToString("D"),
+                    false,
+                    new
+                    {
+                        registration.AgentId,
+                        registeredWeChatInstanceId = registration.WeChatInstanceId,
+                        rejectedWeChatInstanceId = weChatInstanceId
+                    });
+                await db.SaveChangesAsync(cancellationToken);
+            }
+            return new AgentHeartbeatResponse(false, emergencyStop, registration.ConfigurationVersion);
+        }
+
+        await UpsertHeartbeatStateAsync(registration.Id, request, now, cancellationToken);
+        return new AgentHeartbeatResponse(
+            registration.IsEnabled,
+            emergencyStop,
+            registration.ConfigurationVersion);
+    }
+
+    public async Task<IReadOnlyList<AgentListItem>> ListAsync(CancellationToken cancellationToken)
+    {
+        var registrations = await db.AgentRegistrations.AsNoTracking()
+            .OrderBy(x => x.AgentId)
+            .ThenBy(x => x.Id)
+            .ToListAsync(cancellationToken);
+        var states = await db.AgentHeartbeatStates.AsNoTracking()
+            .ToDictionaryAsync(x => x.AgentRegistrationId, cancellationToken);
+        var onlineAfter = timeProvider.GetUtcNow() - OnlineWindow;
+
+        return registrations.Select(registration =>
+        {
+            states.TryGetValue(registration.Id, out var state);
+            return new AgentListItem(
+                registration.Id,
+                registration.AgentId,
+                registration.WeChatInstanceId,
+                registration.IsEnabled,
+                registration.ConfigurationVersion,
+                registration.RegisteredAt,
+                registration.UpdatedAt,
+                registration.Version,
+                state?.SentAt,
+                state?.ReceivedAt,
+                state?.RuntimeState,
+                state?.ReasonCode,
+                state?.Reason,
+                state?.ChangedAt,
+                state?.LastCommandCompletedAt,
+                state?.LastCommandCode,
+                state?.QueueDepth,
+                state?.ActiveExecutions,
+                state?.DryRun,
+                state?.AgentVersion,
+                registration.IsEnabled && state?.ReceivedAt >= onlineAfter);
+        }).ToList();
+    }
+
+    public static string NormalizeAgentId(string agentId) => agentId.Trim().ToUpperInvariant();
+
+    private async Task<AgentRegistration> EnsureRegistrationAsync(
+        string agentId,
+        string normalizedAgentId,
+        string weChatInstanceId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var existing = await db.AgentRegistrations
+            .SingleOrDefaultAsync(x => x.NormalizedAgentId == normalizedAgentId, cancellationToken);
+        if (existing is not null) return existing;
+
+        var registration = new AgentRegistration
+        {
+            Id = Guid.NewGuid(),
+            TenantId = tenant.TenantId,
+            AgentId = agentId,
+            NormalizedAgentId = normalizedAgentId,
+            WeChatInstanceId = weChatInstanceId,
+            IsEnabled = true,
+            ConfigurationVersion = "1",
+            RegisteredAt = now,
+            UpdatedAt = now
+        };
+        db.AgentRegistrations.Add(registration);
+        audit.Add(
+            "agent.registered",
+            nameof(AgentRegistration),
+            registration.Id.ToString("D"),
+            details: new { registration.AgentId, registration.WeChatInstanceId });
+
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+            return registration;
+        }
+        catch (DbUpdateException)
+        {
+            db.ChangeTracker.Clear();
+            existing = await db.AgentRegistrations
+                .SingleOrDefaultAsync(x => x.NormalizedAgentId == normalizedAgentId, cancellationToken);
+            if (existing is not null) return existing;
+            throw;
+        }
+    }
+
+    private async Task UpsertHeartbeatStateAsync(
+        Guid registrationId,
+        AgentHeartbeatRequest request,
+        DateTimeOffset receivedAt,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var state = await db.AgentHeartbeatStates
+                .SingleOrDefaultAsync(x => x.AgentRegistrationId == registrationId, cancellationToken);
+            if (state is not null && request.SentAt <= state.SentAt) return;
+
+            if (state is null)
+            {
+                state = new AgentHeartbeatState
+                {
+                    AgentRegistrationId = registrationId,
+                    TenantId = tenant.TenantId
+                };
+                db.AgentHeartbeatStates.Add(state);
+            }
+
+            ApplyHeartbeat(state, request, receivedAt);
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken);
+                return;
+            }
+            catch (DbUpdateException) when (attempt < 2)
+            {
+                db.ChangeTracker.Clear();
+            }
+        }
+
+        throw new InvalidOperationException("Agent heartbeat state could not be updated after concurrent retries.");
+    }
+
+    private static void ApplyHeartbeat(
+        AgentHeartbeatState state,
+        AgentHeartbeatRequest request,
+        DateTimeOffset receivedAt)
+    {
+        state.SentAt = request.SentAt;
+        state.ReceivedAt = receivedAt;
+        state.RuntimeState = request.Runtime.State;
+        state.ReasonCode = request.Runtime.ReasonCode.Trim();
+        state.Reason = request.Runtime.Reason.Trim();
+        state.ChangedAt = request.Runtime.ChangedAt;
+        state.LastCommandCompletedAt = request.Runtime.LastCommandCompletedAt;
+        state.LastCommandCode = NullIfWhiteSpace(request.Runtime.LastCommandCode);
+        state.QueueDepth = request.QueueDepth;
+        state.ActiveExecutions = request.ActiveExecutions;
+        state.DryRun = request.DryRun;
+        state.AgentVersion = request.AgentVersion.Trim();
+        state.Version++;
+    }
+
+    private static void ValidateTimestamps(AgentHeartbeatRequest request, DateTimeOffset now)
+    {
+        if (request.SentAt == default || request.Runtime.ChangedAt == default)
+            throw DomainException.Validation("invalid_heartbeat_timestamp", "Heartbeat timestamps are required.");
+        if (request.SentAt > now + MaximumClockSkew)
+            throw DomainException.Validation("heartbeat_clock_skew", "Heartbeat SentAt is too far in the future.");
+        if (request.Runtime.ChangedAt > request.SentAt + MaximumClockSkew ||
+            request.Runtime.LastCommandCompletedAt > request.SentAt + MaximumClockSkew)
+            throw DomainException.Validation("invalid_runtime_timestamp", "Runtime timestamps cannot be later than the heartbeat.");
+    }
+
+    private static string? NullIfWhiteSpace(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+}

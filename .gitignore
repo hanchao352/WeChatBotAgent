@@ -1,0 +1,31 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Frontend
+**/node_modules/
+**/dist/
+*.tsbuildinfo
+
+# Local runtime data and secrets
+/src/backend/WeChatBot.Backend/runtime/
+**/state/
+**/backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+
+# Logs and editor files
+*.log
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

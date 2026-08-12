@@ -1,0 +1,183 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.OpenApi;
+using WeChatBot.Backend.Data;
+using WeChatBot.Backend.Infrastructure;
+using WeChatBot.Backend.Services;
+
+var builder = WebApplication.CreateBuilder(args);
+var localEnvironment = builder.Environment.IsDevelopment() || builder.Environment.IsEnvironment("Testing");
+
+ApplyAndValidateSecrets(builder.Configuration, localEnvironment);
+EnsureSqliteDirectory(builder.Configuration.GetConnectionString("Database"));
+
+builder.Services.Configure<AuthOptions>(builder.Configuration.GetSection("Auth"));
+builder.Services.Configure<ActivationOptions>(builder.Configuration.GetSection("Activation"));
+builder.Services.Configure<AuditOptions>(builder.Configuration.GetSection("Audit"));
+builder.Services.Configure<BackupOptions>(builder.Configuration.GetSection("Backup"));
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<TenantContext>();
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlite(builder.Configuration.GetConnectionString("Database")));
+
+builder.Services
+    .AddAuthentication(ApiKeyAuthenticationHandler.AuthenticationSchemeName)
+    .AddScheme<AuthenticationSchemeOptions, ApiKeyAuthenticationHandler>(ApiKeyAuthenticationHandler.AuthenticationSchemeName, _ => { });
+builder.Services.AddAuthorization(options =>
+{
+    options.FallbackPolicy = new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .Build();
+});
+
+builder.Services.AddProblemDetails(options =>
+{
+    options.CustomizeProblemDetails = context =>
+    {
+        context.ProblemDetails.Extensions["traceId"] = context.HttpContext.TraceIdentifier;
+    };
+});
+builder.Services.AddExceptionHandler<ApiExceptionHandler>();
+builder.Services.AddControllers()
+    .AddJsonOptions(options => options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)));
+builder.Services.Configure<ApiBehaviorOptions>(options =>
+{
+    options.InvalidModelStateResponseFactory = context =>
+    {
+        var problem = new ValidationProblemDetails(context.ModelState)
+        {
+            Status = StatusCodes.Status400BadRequest,
+            Title = "Request validation failed"
+        };
+        problem.Extensions["errorCode"] = "validation_failed";
+        problem.Extensions["traceId"] = context.HttpContext.TraceIdentifier;
+        return new BadRequestObjectResult(problem);
+    };
+});
+
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "WeChatBot commercial core API",
+        Version = "v1",
+        Description = "Backend orchestration API. It does not claim or simulate successful WeChat UI Automation execution."
+    });
+    options.AddSecurityDefinition(ApiKeyAuthenticationHandler.AuthenticationSchemeName, new OpenApiSecurityScheme
+    {
+        Type = SecuritySchemeType.ApiKey,
+        In = ParameterLocation.Header,
+        Name = ApiKeyAuthenticationHandler.HeaderName,
+        Description = "Server-validated administrative API key."
+    });
+    options.AddSecurityRequirement(document => new OpenApiSecurityRequirement
+    {
+        [new OpenApiSecuritySchemeReference(ApiKeyAuthenticationHandler.AuthenticationSchemeName, document, null)] = []
+    });
+});
+
+builder.Services.AddScoped<AuditService>();
+builder.Services.AddScoped<ActivationCodeHasher>();
+builder.Services.AddScoped<ActivationService>();
+builder.Services.AddScoped<EntitlementService>();
+builder.Services.AddScoped<RemarkService>();
+builder.Services.AddScoped<LogicalBackupService>();
+builder.Services.AddScoped<AgentControlService>();
+
+var app = builder.Build();
+
+app.UseExceptionHandler();
+app.UseStatusCodePages(async statusCodeContext =>
+{
+    var response = statusCodeContext.HttpContext.Response;
+    if (response.HasStarted || response.ContentLength is not null || !string.IsNullOrEmpty(response.ContentType)) return;
+    var title = response.StatusCode switch
+    {
+        StatusCodes.Status401Unauthorized => "Authentication required",
+        StatusCodes.Status403Forbidden => "Access denied",
+        StatusCodes.Status404NotFound => "Resource not found",
+        _ => "Request failed"
+    };
+    await response.WriteAsJsonAsync(new ProblemDetails
+    {
+        Status = response.StatusCode,
+        Title = title,
+        Extensions =
+        {
+            ["errorCode"] = response.StatusCode switch
+            {
+                StatusCodes.Status401Unauthorized => "unauthorized",
+                StatusCodes.Status403Forbidden => "forbidden",
+                StatusCodes.Status404NotFound => "route_not_found",
+                _ => "request_failed"
+            },
+            ["traceId"] = statusCodeContext.HttpContext.TraceIdentifier
+        }
+    }, cancellationToken: statusCodeContext.HttpContext.RequestAborted);
+});
+app.UseSwagger();
+app.UseSwaggerUI();
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+
+await DbInitializer.InitializeAsync(app.Services, localEnvironment);
+await app.RunAsync();
+
+static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvironment)
+{
+    if (localEnvironment)
+    {
+        configuration["Auth:ApiKey"] = EmptyOrExisting(configuration["Auth:ApiKey"], "wechatbot-local-development-key-change-me");
+        configuration["Auth:AgentApiKey"] = EmptyOrExisting(configuration["Auth:AgentApiKey"], "wechatbot-local-agent-development-key-change-me");
+        configuration["Activation:HashPepper"] = EmptyOrExisting(configuration["Activation:HashPepper"], "local-activation-pepper-change-before-production-2026");
+        configuration["Audit:IntegrityKey"] = EmptyOrExisting(configuration["Audit:IntegrityKey"], "local-audit-integrity-key-change-before-production-2026");
+        configuration["Backup:EncryptionKeyBase64"] = EmptyOrExisting(
+            configuration["Backup:EncryptionKeyBase64"],
+            Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes("local-backup-key-change-before-production"))));
+    }
+
+    RequireSecret(configuration["Auth:ApiKey"], "Auth__ApiKey", 32);
+    RequireSecret(configuration["Auth:AgentApiKey"], "Auth__AgentApiKey", 32);
+    if (string.Equals(configuration["Auth:ApiKey"], configuration["Auth:AgentApiKey"], StringComparison.Ordinal))
+        throw new InvalidOperationException("Auth__ApiKey and Auth__AgentApiKey must be different secrets.");
+    RequireSecret(configuration["Activation:HashPepper"], "Activation__HashPepper", 32);
+    RequireSecret(configuration["Audit:IntegrityKey"], "Audit__IntegrityKey", 32);
+    var backupKey = configuration["Backup:EncryptionKeyBase64"];
+    try
+    {
+        if (string.IsNullOrWhiteSpace(backupKey) || Convert.FromBase64String(backupKey).Length != 32) throw new FormatException();
+    }
+    catch (FormatException)
+    {
+        throw new InvalidOperationException("Backup__EncryptionKeyBase64 must contain a base64-encoded 32-byte key.");
+    }
+    if (!Guid.TryParse(configuration["Auth:TenantId"], out var tenantId) || tenantId == Guid.Empty)
+        throw new InvalidOperationException("Auth__TenantId must contain a non-empty GUID.");
+}
+
+static string EmptyOrExisting(string? current, string fallback) => string.IsNullOrWhiteSpace(current) ? fallback : current;
+
+static void RequireSecret(string? value, string environmentVariable, int minimumLength)
+{
+    if (string.IsNullOrWhiteSpace(value) || value.Length < minimumLength)
+        throw new InvalidOperationException($"{environmentVariable} is required and must be at least {minimumLength} characters.");
+}
+
+static void EnsureSqliteDirectory(string? connectionString)
+{
+    if (string.IsNullOrWhiteSpace(connectionString)) throw new InvalidOperationException("ConnectionStrings__Database is required.");
+    var parsed = new SqliteConnectionStringBuilder(connectionString);
+    if (string.IsNullOrWhiteSpace(parsed.DataSource) || parsed.DataSource == ":memory:") return;
+    var fullPath = Path.GetFullPath(parsed.DataSource);
+    Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+}
+
+public partial class Program;
