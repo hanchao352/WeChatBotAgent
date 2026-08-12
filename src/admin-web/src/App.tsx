@@ -406,13 +406,14 @@ function BackupsPage({
   backups: Backup[]
   apiConnected: boolean
   onCreate: () => Promise<void>
-  onRestore: (id: string) => Promise<void>
+  onRestore: (id: string, operationKey: string) => Promise<void>
 }) {
   const [restore, setRestore] = useState<Backup | null>(null)
   const [confirm, setConfirm] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const restoreAttempt = useRef<{ backupId: string; key: string } | null>(null)
   const createBackup = async () => {
     if (!apiConnected) return
     setBusy(true); setError('')
@@ -425,14 +426,24 @@ function BackupsPage({
     setBusy(true); setError('')
     try {
       if (!apiConnected) return
-      await onRestore(restore.id)
+      if (restoreAttempt.current?.backupId !== restore.id) {
+        restoreAttempt.current = { backupId: restore.id, key: `restore-${crypto.randomUUID()}` }
+      }
+      await onRestore(restore.id, restoreAttempt.current.key)
+      restoreAttempt.current = null
       setNotice(`${restore.id} 已完成受控合并恢复，自动化保持暂停`); setRestore(null); setConfirm('')
     } catch (restoreError) {
       setError(restoreError instanceof Error ? restoreError.message : '恢复任务创建失败')
     } finally { setBusy(false) }
   }
+  const closeRestore = () => {
+    restoreAttempt.current = null
+    setRestore(null)
+    setConfirm('')
+    setError('')
+  }
   return <div className="page-stack"><section className="backup-summary"><div><ShieldCheck size={21} /><span>备份策略</span><strong>{apiConnected ? '正常' : '状态未知'}</strong><small>每次恢复前自动再备份</small></div><div><DatabaseBackup size={21} /><span>最近备份</span><strong>{backups.length ? backups[0].createdAt : '暂无'}</strong><small>{apiConnected ? '后端清单已连接' : '仅显示最后快照'}</small></div><div><ArchiveRestore size={21} /><span>恢复模式</span><strong>受控合并</strong><small>修改当前库并强制暂停自动化</small></div></section>{notice && <div className="toast-inline" role="status"><Check size={16} />{notice}<button title="关闭" aria-label="关闭" onClick={() => setNotice('')}><X size={15} /></button></div>}{error && <div className="error-inline" role="alert"><CircleAlert size={16} />{error}<button title="关闭" aria-label="关闭" onClick={() => setError('')}><X size={15} /></button></div>}<section className="panel data-panel"><div className="panel-header toolbar-heading"><div><h2>备份记录</h2><p>恢复会修改当前库；机器人保持暂停，旧发送任务不会自动重放</p></div><button className="primary-button" disabled={!apiConnected || busy} onClick={() => void createBackup()}><DatabaseBackup size={16} />{busy ? '处理中' : '立即备份'}</button></div><div className="table-wrap"><table><thead><tr><th>备份编号</th><th>创建时间</th><th>类型</th><th>大小</th><th>校验和</th><th>状态</th><th /></tr></thead><tbody>{backups.map((backup) => <tr key={backup.id}><td className="mono-cell">{backup.id}</td><td>{backup.createdAt}</td><td>{backup.type === 'full' ? '全量' : '逻辑备份'}</td><td>{backup.size}</td><td className="mono-cell">{backup.checksum}</td><td><StatusBadge status={backup.status} /></td><td><button className="secondary-button small-button" disabled={!apiConnected || backup.status !== 'verified'} onClick={() => setRestore(backup)}><ArchiveRestore size={15} />恢复</button></td></tr>)}</tbody></table></div>{backups.length === 0 && <div className="empty-state">暂无备份记录</div>}</section>
-    {restore && <Modal title="执行受控合并恢复" onClose={() => { setRestore(null); setConfirm('') }}><div className="modal-body"><div className="danger-notice"><CircleAlert size={19} /><div><strong>此操作会直接修改当前数据库</strong><span>系统先自动创建恢复前备份，再覆盖联系人、群和备注规则配置；权益、兑换和流水仅补缺，不会用旧快照覆盖现有事实。恢复后自动化保持暂停。</span></div></div><dl className="restore-details"><div><dt>备份编号</dt><dd>{restore.id}</dd></div><div><dt>创建时间</dt><dd>{restore.createdAt}</dd></div><div><dt>完整性</dt><dd>校验通过</dd></div></dl><label className="field"><span>输入 RESTORE 确认</span><input aria-label="输入 RESTORE 确认" value={confirm} onChange={(event) => setConfirm(event.target.value)} autoComplete="off" /></label></div><footer className="modal-footer"><button className="secondary-button" onClick={() => setRestore(null)}>取消</button><button className="danger-button" disabled={!apiConnected || confirm !== 'RESTORE' || busy} onClick={() => void performRestore()}><ArchiveRestore size={16} />{busy ? '处理中' : '确认恢复当前库'}</button></footer></Modal>}
+    {restore && <Modal title="执行受控合并恢复" onClose={closeRestore}><div className="modal-body"><div className="danger-notice"><CircleAlert size={19} /><div><strong>此操作会直接修改当前数据库</strong><span>系统先自动创建恢复前备份，再覆盖联系人、群和备注规则配置；权益、兑换和流水仅补缺，不会用旧快照覆盖现有事实。恢复后自动化保持暂停。</span></div></div><dl className="restore-details"><div><dt>备份编号</dt><dd>{restore.id}</dd></div><div><dt>创建时间</dt><dd>{restore.createdAt}</dd></div><div><dt>完整性</dt><dd>校验通过</dd></div></dl><label className="field"><span>输入 RESTORE 确认</span><input aria-label="输入 RESTORE 确认" value={confirm} onChange={(event) => setConfirm(event.target.value)} autoComplete="off" /></label></div><footer className="modal-footer"><button className="secondary-button" onClick={closeRestore}>取消</button><button className="danger-button" disabled={!apiConnected || confirm !== 'RESTORE' || busy} onClick={() => void performRestore()}><ArchiveRestore size={16} />{busy ? '处理中' : '确认恢复当前库'}</button></footer></Modal>}
   </div>
 }
 
@@ -546,6 +557,10 @@ function mapSnapshot(snapshot: ConsoleSnapshot) {
 function App() {
   const [page, setPage] = useState<PageId>('dashboard')
   const [mobileNav, setMobileNav] = useState(false)
+  const sidebarRef = useRef<HTMLElement>(null)
+  const mobileCloseRef = useRef<HTMLButtonElement>(null)
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
+  const mainRef = useRef<HTMLElement>(null)
   const [targets, setTargets] = useState<Target[]>([])
   const [agents, setAgents] = useState<ApiAgent[]>([])
   const [systemState, setSystemState] = useState<ApiSystemState | null>(null)
@@ -630,6 +645,65 @@ function App() {
       document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
   }, [refreshData])
+  useEffect(() => {
+    if (!mobileNav) return
+    const mobileViewport = window.matchMedia('(max-width: 760px)')
+    if (!mobileViewport.matches) {
+      setMobileNav(false)
+      return
+    }
+
+    const sidebar = sidebarRef.current
+    const mainArea = mainRef.current
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : menuButtonRef.current
+    const previousOverflow = document.body.style.overflow
+    mobileCloseRef.current?.focus()
+    if (mainArea) {
+      mainArea.inert = true
+      mainArea.setAttribute('aria-hidden', 'true')
+    }
+    document.body.style.overflow = 'hidden'
+
+    const closeWhenDesktop = (event: MediaQueryListEvent) => {
+      if (!event.matches) setMobileNav(false)
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setMobileNav(false)
+        return
+      }
+      if (event.key !== 'Tab' || !sidebar) return
+      const focusable = Array.from(sidebar.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ))
+      if (focusable.length === 0) {
+        event.preventDefault()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && (document.activeElement === first || !sidebar.contains(document.activeElement))) {
+        event.preventDefault(); last.focus()
+      } else if (!event.shiftKey && (document.activeElement === last || !sidebar.contains(document.activeElement))) {
+        event.preventDefault(); first.focus()
+      }
+    }
+    mobileViewport.addEventListener('change', closeWhenDesktop)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      mobileViewport.removeEventListener('change', closeWhenDesktop)
+      document.removeEventListener('keydown', handleKeyDown)
+      document.body.style.overflow = previousOverflow
+      if (mainArea) {
+        mainArea.inert = false
+        mainArea.removeAttribute('aria-hidden')
+      }
+      previouslyFocused?.focus()
+    }
+  }, [mobileNav])
   const handleActivation = async (
     input: { targetId: string; targetKind: TargetType; packageCode: 'BASIC' | 'ADVANCED_GENERAL'; duration: ApiEntitlement['duration'] },
     operationKey: string,
@@ -637,7 +711,9 @@ function App() {
     await runMutation(() => activateTarget(input, operationKey))
   }
   const handleCreateBackup = async () => { await runMutation(() => createLogicalBackup('管理台手工备份')) }
-  const handleRestore = async (id: string) => { await runMutation(() => createControlledMergeRestore(id)) }
+  const handleRestore = async (id: string, operationKey: string) => {
+    await runMutation(() => createControlledMergeRestore(id, operationKey))
+  }
   const handleQueueRemark = async (ruleId: string, targetId: string) => {
     return runMutation(() => queueRemarkTask(ruleId, targetId))
   }
@@ -649,14 +725,14 @@ function App() {
   const navigate = (id: PageId) => { setPage(id); setMobileNav(false) }
   return (
     <div className="app-shell">
-      <aside className={`sidebar ${mobileNav ? 'open' : ''}`}>
-        <div className="brand"><span className="brand-mark"><Bot size={21} /></span><div><strong>微服中控</strong><small>Automation Console</small></div><button className="icon-button mobile-close" title="关闭导航" onClick={() => setMobileNav(false)}><X size={19} /></button></div>
+      <aside ref={sidebarRef} id="primary-navigation" className={`sidebar ${mobileNav ? 'open' : ''}`} role={mobileNav ? 'dialog' : undefined} aria-modal={mobileNav ? true : undefined} aria-label={mobileNav ? '主导航' : undefined}>
+        <div className="brand"><span className="brand-mark"><Bot size={21} /></span><div><strong>微服中控</strong><small>Automation Console</small></div><button ref={mobileCloseRef} className="icon-button mobile-close" title="关闭导航" aria-label="关闭导航" onClick={() => setMobileNav(false)}><X size={19} /></button></div>
         <nav aria-label="主导航">{navItems.map((item) => { const Icon = item.icon; return <button key={item.id} aria-current={page === item.id ? 'page' : undefined} className={page === item.id ? 'active' : ''} onClick={() => navigate(item.id)}><Icon size={18} /><span>{item.label}</span>{item.id === 'mentions' && pendingMentions > 0 && <b aria-label={`${pendingMentions} 条待处理`}>{pendingMentions}</b>}</button> })}</nav>
         <div className="sidebar-footer"><div className="operator"><span>管</span><div><strong>平台管理员</strong><small>{apiConnected ? `${import.meta.env.DEV ? '开发环境' : '安全会话'} · API 已连接` : '离线只读'}</small></div><ChevronDown size={15} aria-hidden="true" /></div></div>
       </aside>
       {mobileNav && <button className="nav-scrim" aria-label="关闭导航遮罩" onClick={() => setMobileNav(false)} />}
-      <main className="main-area">
-        <header className="topbar"><div className="title-row"><button className="icon-button menu-button" title="打开导航" onClick={() => setMobileNav(true)}><Menu size={20} /></button><div><h1>{pageTitles[page].title}</h1><p>{pageTitles[page].subtitle}</p></div></div><div className="topbar-actions"><span className={`environment ${apiConnected ? '' : 'offline'}`}><Activity size={14} />{apiConnected ? 'API 已连接' : '离线只读'}</span><button className={`icon-button bordered ${refreshing ? 'spinning' : ''}`} title="刷新数据" disabled={refreshing} onClick={() => void refreshData()}><RefreshCw size={17} /></button></div></header>
+      <main ref={mainRef} className="main-area">
+        <header className="topbar"><div className="title-row"><button ref={menuButtonRef} className="icon-button menu-button" title="打开导航" aria-label="打开导航" aria-expanded={mobileNav} aria-controls="primary-navigation" onClick={() => setMobileNav(true)}><Menu size={20} /></button><div><h1>{pageTitles[page].title}</h1><p>{pageTitles[page].subtitle}</p></div></div><div className="topbar-actions"><span className={`environment ${apiConnected ? '' : 'offline'}`}><Activity size={14} />{apiConnected ? 'API 已连接' : '离线只读'}</span><button className={`icon-button bordered ${refreshing ? 'spinning' : ''}`} title="刷新数据" disabled={refreshing} onClick={() => void refreshData()}><RefreshCw size={17} /></button></div></header>
         <div className="page-content">
           {apiError && <div className="connection-banner" role="alert"><CircleAlert size={16} /><span>控制面未连接，{systemState ? '当前仅显示最后一次成功快照' : '当前没有可用数据'}：{apiError}</span><button disabled={refreshing} onClick={() => void refreshData(true)}>{refreshing ? '重连中' : '重试'}</button></div>}
           {page === 'dashboard' && <DashboardPage apiConnected={apiConnected} targets={targets} mentions={mentions} entitlements={entitlements} backups={backups} remarkTasks={remarkTasks} agents={agents} systemState={systemState} onAutomationChange={handleAutomationChange} />}

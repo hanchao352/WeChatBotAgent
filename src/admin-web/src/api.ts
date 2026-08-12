@@ -237,10 +237,10 @@ export async function createLogicalBackup(reason: string): Promise<ApiBackupVeri
   return request<ApiBackupVerification>(`/api/backups/${created.id}/verify`, { method: 'POST' })
 }
 
-export async function createControlledMergeRestore(backupId: string) {
+export async function createControlledMergeRestore(backupId: string, operationKey: string) {
   return request(`/api/backups/${backupId}/restore`, {
     method: 'POST',
-    headers: { 'Idempotency-Key': idempotencyKey('restore') },
+    headers: { 'Idempotency-Key': operationKey },
     body: JSON.stringify({ confirmation: 'RESTORE' }),
   })
 }
