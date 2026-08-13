@@ -1,6 +1,8 @@
+using System.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using WeChatBot.Backend.Contracts;
 using WeChatBot.Backend.Data;
 using WeChatBot.Backend.Domain;
@@ -9,6 +11,14 @@ using WeChatBot.Backend.Services;
 
 namespace WeChatBot.Backend.Controllers;
 
+/// <summary>表示群提及事件写入后的授权决定和幂等状态。</summary>
+/// <param name="Id">服务端事件主键。</param>
+/// <param name="ExternalEventId">调用方提供的稳定事件标识。</param>
+/// <param name="Decision">本次事件的处理决定。</param>
+/// <param name="DecisionReason">不含敏感信息的决定原因。</param>
+/// <param name="EntitlementId">允许处理时匹配到的权益主键。</param>
+/// <param name="SuggestedMessage">需要告知用户的可选业务提示。</param>
+/// <param name="Duplicate">是否为完全相同事件的幂等重放。</param>
 public sealed record GroupMentionResponse(
     Guid Id,
     string ExternalEventId,
@@ -18,6 +28,7 @@ public sealed record GroupMentionResponse(
     string? SuggestedMessage,
     bool Duplicate);
 
+/// <summary>提供管理员群提及查询和已认证 Agent 事件上报接口。</summary>
 [ApiController]
 [Route("api/group-mentions")]
 public sealed class MentionsController(
@@ -26,7 +37,8 @@ public sealed class MentionsController(
     TimeProvider timeProvider,
     EntitlementService entitlements,
     AgentControlService agents,
-    AuditService audit) : ControllerBase
+    AuditService audit,
+    IAgentMutationSynchronization synchronization) : ControllerBase
 {
     [HttpGet]
     [Authorize(Roles = "Admin")]
@@ -61,11 +73,48 @@ public sealed class MentionsController(
         AgentGroupMentionRequest request,
         CancellationToken cancellationToken)
     {
+        await using var transaction = await BeginWriteTransactionAsync(cancellationToken);
+        // 写锁早于身份复核，凭据轮换、吊销或恢复吊销只能在本次上报提交之后生效，消除校验后写入窗口。
         await agents.EnsureActiveBindingAsync(
             agentId,
             request.WeChatInstanceId,
             cancellationToken);
-        return await IngestCore(request.Event, cancellationToken);
+        await synchronization.AfterBindingValidatedAsync("group-mention.ingest", cancellationToken);
+        var result = await IngestCore(request.Event, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return result;
+    }
+
+    /// <summary>
+    /// 开启 Agent 群提及上报的数据库写事务，并通过零行更新取得 SQLite 写锁。
+    /// 管理员上报不依赖 Agent 凭据，因此继续使用原有短事务路径。
+    /// </summary>
+    /// <param name="cancellationToken">数据库事务取消令牌。</param>
+    /// <returns>持有群提及表写锁的 EF Core 事务。</returns>
+    private async Task<IDbContextTransaction> BeginWriteTransactionAsync(CancellationToken cancellationToken)
+    {
+        var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
+        try
+        {
+            await db.Database.ExecuteSqlRawAsync(
+                "UPDATE GroupMentions SET CapturedAt = CapturedAt WHERE 0 = 1;",
+                cancellationToken);
+            return transaction;
+        }
+        catch
+        {
+            // 探针执行失败时事务尚未交给调用方，必须立即回滚并释放底层连接。
+            try
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+            finally
+            {
+                await transaction.DisposeAsync();
+            }
+
+            throw;
+        }
     }
 
     private async Task<ActionResult<GroupMentionResponse>> IngestCore(

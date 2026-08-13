@@ -15,12 +15,17 @@ var builder = WebApplication.CreateBuilder(args);
 var localEnvironment = builder.Environment.IsDevelopment() || builder.Environment.IsEnvironment("Testing");
 
 ApplyAndValidateSecrets(builder.Configuration, localEnvironment);
+ValidateRemarkTaskLeaseConfiguration(builder.Configuration);
 EnsureSqliteDirectory(builder.Configuration.GetConnectionString("Database"));
 
 builder.Services.Configure<AuthOptions>(builder.Configuration.GetSection("Auth"));
 builder.Services.Configure<ActivationOptions>(builder.Configuration.GetSection("Activation"));
 builder.Services.Configure<AuditOptions>(builder.Configuration.GetSection("Audit"));
 builder.Services.Configure<BackupOptions>(builder.Configuration.GetSection("Backup"));
+// 备注任务租约使用独立配置，避免把执行恢复时间隐式绑定到心跳或数据库超时。
+builder.Services.Configure<RemarkTaskLeaseOptions>(builder.Configuration.GetSection("RemarkTaskLease"));
+// 游标保护使用独立秘密，避免与鉴权、激活码、审计或备份密钥复用。
+builder.Services.Configure<CursorPaginationOptions>(builder.Configuration.GetSection("Pagination"));
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<TenantContext>();
@@ -90,6 +95,14 @@ builder.Services.AddScoped<EntitlementService>();
 builder.Services.AddScoped<RemarkService>();
 builder.Services.AddScoped<LogicalBackupService>();
 builder.Services.AddScoped<AgentControlService>();
+// 所有 Agent 业务端点共享同一个 claim/路由/正文/数据库绑定校验器，防止单个端点遗漏身份约束。
+builder.Services.AddScoped<AgentIdentityBindingService>();
+// 状态转换钩子默认不执行额外逻辑；集成测试替换它以稳定停在身份复核与提交之间，验证凭据竞态。
+builder.Services.AddScoped<IAgentMutationSynchronization, NoOpAgentMutationSynchronization>();
+builder.Services.AddScoped<IRemarkTaskMutationSynchronization, NoOpRemarkTaskMutationSynchronization>();
+builder.Services.AddScoped<RemarkTaskLeaseService>();
+// 保护器不保存请求或租户状态，可作为单例复用；租户绑定信息在每次保护或解析时显式传入。
+builder.Services.AddSingleton<CursorProtector>();
 
 var app = builder.Build();
 
@@ -138,6 +151,23 @@ if (!localEnvironment)
 await DbInitializer.InitializeAsync(app.Services, localEnvironment);
 await app.RunAsync();
 
+/// <summary>
+/// 验证备注任务租约时长处于服务允许范围内，防止错误配置造成永久独占或高频续租。
+/// </summary>
+/// <param name="configuration">应用配置来源。</param>
+static void ValidateRemarkTaskLeaseConfiguration(IConfiguration configuration)
+{
+    const int minimumLeaseSeconds = 15;
+    const int maximumLeaseSeconds = 300;
+    var configured = configuration["RemarkTaskLease:DurationSeconds"];
+    if (!int.TryParse(configured, out var durationSeconds) ||
+        durationSeconds is < minimumLeaseSeconds or > maximumLeaseSeconds)
+    {
+        throw new InvalidOperationException(
+            $"RemarkTaskLease__DurationSeconds must be between {minimumLeaseSeconds} and {maximumLeaseSeconds}.");
+    }
+}
+
 static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvironment)
 {
     if (localEnvironment)
@@ -146,20 +176,40 @@ static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvi
         configuration["Auth:AgentApiKey"] = EmptyOrExisting(configuration["Auth:AgentApiKey"], "wechatbot-local-agent-development-key-change-me");
         configuration["Activation:HashPepper"] = EmptyOrExisting(configuration["Activation:HashPepper"], "local-activation-pepper-change-before-production-2026");
         configuration["Audit:IntegrityKey"] = EmptyOrExisting(configuration["Audit:IntegrityKey"], "local-audit-integrity-key-change-before-production-2026");
+        configuration["Pagination:ProtectionKey"] = EmptyOrExisting(
+            configuration["Pagination:ProtectionKey"],
+            "local-cursor-protection-key-change-before-production-2026");
         configuration["Backup:EncryptionKeyBase64"] = EmptyOrExisting(
             configuration["Backup:EncryptionKeyBase64"],
             Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes("local-backup-key-change-before-production"))));
         configuration["Auth:AllowAgentAutoRegistration"] = EmptyOrExisting(
             configuration["Auth:AllowAgentAutoRegistration"],
             "true");
+        configuration["Auth:AllowLegacySharedAgentApiKey"] = EmptyOrExisting(
+            configuration["Auth:AllowLegacySharedAgentApiKey"],
+            "false");
     }
 
     RequireSecret(configuration["Auth:ApiKey"], "Auth__ApiKey", 32);
-    RequireSecret(configuration["Auth:AgentApiKey"], "Auth__AgentApiKey", 32);
-    if (string.Equals(configuration["Auth:ApiKey"], configuration["Auth:AgentApiKey"], StringComparison.Ordinal))
-        throw new InvalidOperationException("Auth__ApiKey and Auth__AgentApiKey must be different secrets.");
+    if (!bool.TryParse(
+            configuration["Auth:AllowLegacySharedAgentApiKey"],
+            out var allowLegacySharedAgentApiKey))
+    {
+        throw new InvalidOperationException(
+            "Auth__AllowLegacySharedAgentApiKey must be explicitly set to true or false.");
+    }
+    if (allowLegacySharedAgentApiKey)
+    {
+        RequireSecret(configuration["Auth:AgentApiKey"], "Auth__AgentApiKey", 32);
+        if (string.Equals(configuration["Auth:ApiKey"], configuration["Auth:AgentApiKey"], StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Auth__ApiKey and Auth__AgentApiKey must be different secrets.");
+        }
+    }
     RequireSecret(configuration["Activation:HashPepper"], "Activation__HashPepper", 32);
     RequireSecret(configuration["Audit:IntegrityKey"], "Audit__IntegrityKey", 32);
+    RequireSecret(configuration["Pagination:ProtectionKey"], "Pagination__ProtectionKey", 32);
     RequireActor(configuration["Auth:ActorName"], "Auth__ActorName");
     RequireActor(configuration["Auth:AgentActorName"], "Auth__AgentActorName");
     if (string.Equals(
@@ -182,6 +232,11 @@ static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvi
         throw new InvalidOperationException("Auth__TenantId must contain a non-empty GUID.");
     if (!localEnvironment)
     {
+        if (allowLegacySharedAgentApiKey)
+        {
+            throw new InvalidOperationException(
+                "Production Auth__AllowLegacySharedAgentApiKey must be explicitly set to false; use per-Agent credentials.");
+        }
         if (tenantId == Guid.Parse("11111111-1111-1111-1111-111111111111") ||
             string.Equals(configuration["Auth:ActorName"]?.Trim(), "local-admin", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(configuration["Auth:AgentActorName"]?.Trim(), "local-agent", StringComparison.OrdinalIgnoreCase))
@@ -193,6 +248,7 @@ static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvi
             configuration["Auth:ApiKey"],
             "wechatbot-local-development-key-change-me",
             "Auth__ApiKey");
+        // 即使兼容开关关闭，也拒绝在生产配置中遗留公开共享密钥，避免后续误开开关即暴露。
         RejectDevelopmentSecret(
             configuration["Auth:AgentApiKey"],
             "wechatbot-local-agent-development-key-change-me",
@@ -205,6 +261,10 @@ static void ApplyAndValidateSecrets(IConfiguration configuration, bool localEnvi
             configuration["Audit:IntegrityKey"],
             "local-audit-integrity-key-change-before-production-2026",
             "Audit__IntegrityKey");
+        RejectDevelopmentSecret(
+            configuration["Pagination:ProtectionKey"],
+            "local-cursor-protection-key-change-before-production-2026",
+            "Pagination__ProtectionKey");
         RejectDevelopmentSecret(
             configuration["Backup:EncryptionKeyBase64"],
             Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes("local-backup-key-change-before-production"))),
@@ -273,4 +333,5 @@ static void RequireAbsoluteDirectory(string? path, string environmentVariable)
         throw new InvalidOperationException($"Production {environmentVariable} must be an absolute path.");
 }
 
+/// <summary>为 ASP.NET Core 入口提供集成测试可发现的公开类型。</summary>
 public partial class Program;

@@ -27,9 +27,11 @@ and `FlaUI.UIA3` for read-only process, main-window, and control-tree inspection
 - When a heartbeat endpoint is configured, restart remains paused until the
   control plane accepts the first heartbeat lease. Offline startup cannot
   bypass an existing control-plane emergency stop.
-- A heartbeat endpoint also requires a control-plane API key. The agent sends
-  it only in the `X-Api-Key` request header, never in the heartbeat payload or
-  logs, and does not follow redirects that could forward the credential.
+- A heartbeat endpoint requires the Agent's own independent credential. The
+  agent sends it only in the `X-Api-Key` request header, never in the heartbeat
+  payload or logs, and does not follow redirects that could forward it. The
+  backend binds the credential to the registered Agent and WeChat instance;
+  another Agent's identifier cannot be substituted in a request body.
 
 ## Commands
 
@@ -37,8 +39,8 @@ and `FlaUI.UIA3` for read-only process, main-window, and control-tree inspection
 dotnet run --project src/agent/WeChatBot.Agent -- --help
 dotnet run --project src/agent/WeChatBot.Agent -- --self-check --dry-run --supported-version-prefixes=4.0.5 --required-automation-id-fingerprints="[structural:sha256=FULL_64_HEX_DIGEST]"
 dotnet run --project src/agent/WeChatBot.Agent -- --diagnose
-$env:WECHATBOT_AGENT_CONTROL_PLANE_API_KEY = "read-from-a-secret-store"
-dotnet run --project src/agent/WeChatBot.Agent -- --run --dry-run --supported-version-prefixes=4.0.5 --heartbeat-uri=https://control.example/api/agents/heartbeat
+$env:WECHATBOT_AGENT_CREDENTIAL = "read-from-a-secret-store"
+dotnet run --project src/agent/WeChatBot.Agent -- --run --dry-run --supported-version-prefixes=4.0.5 --heartbeat-uri=https://control.example/api/agents/heartbeat --remark-task-lease-uri=https://control.example/api/agents
 ```
 
 The same settings can be supplied with these environment variables:
@@ -49,14 +51,17 @@ WECHATBOT_AGENT_ID
 WECHATBOT_AGENT_INSTANCE_ID
 WECHATBOT_AGENT_STATE_DIRECTORY
 WECHATBOT_AGENT_HEARTBEAT_URI
-WECHATBOT_AGENT_CONTROL_PLANE_API_KEY
+WECHATBOT_AGENT_REMARK_TASK_LEASE_URI
+WECHATBOT_AGENT_CREDENTIAL
 WECHATBOT_AGENT_SUPPORTED_VERSION_PREFIXES
 WECHATBOT_AGENT_REQUIRED_AUTOMATION_ID_FINGERPRINTS
 ```
 
-`--control-plane-api-key=value` is also supported, but the environment variable
-is preferred because command-line arguments may be visible to local process
-inspection tools. The API key is required only when a heartbeat URI is set.
+`--agent-credential=value` is also supported, but the environment variable is
+preferred because command-line arguments may be visible to local process
+inspection tools. The deprecated `--control-plane-api-key` and
+`WECHATBOT_AGENT_CONTROL_PLANE_API_KEY` names remain migration aliases. The
+credential is required only when a heartbeat URI is set.
 
 Do not add a version to the compatibility allow-list until its title and UIA
 signature have passed the controlled compatibility test. Use `--diagnose` to
@@ -88,13 +93,33 @@ required; a version allow-list without them cannot pass the safety gate.
   healthy dry-run heartbeat from the matching enabled Agent/WeChat binding.
   The Agent cannot list stored messages or use the administrative message
   endpoint.
-- Remote remark-task claiming and completion are intentionally not exposed to
-  Agent credentials in this baseline. `RemarkTask` does not yet contain a
-  claim owner, opaque lease token, lease expiry, attempt count, or result
-  deduplication identity. Those fields and an atomic claim/renew/complete
-  protocol must be added in a migration before multiple agents can safely
-  consume tasks. The existing administrative completion endpoint is not an
-  Agent execution protocol.
+- The backend exposes an atomic remote remark-task lease protocol through
+  `POST /api/agents/{agentId}/remark-tasks/claim` plus per-task `renew`,
+  `release`, and `complete` endpoints. It binds every transition to the Agent,
+  WeChat instance, opaque lease-token hash, expiry, and task version, and uses
+  a caller result ID for completion deduplication. Logical backups strip active
+  leases, so restored pending tasks must be claimed again.
+- Configuring `--remark-task-lease-uri` does not make the long-running Agent
+  claim production tasks in this forced dry-run build. Repeatedly claiming and
+  releasing the oldest pending task would starve later tasks and amplify
+  database writes without producing a real completion. The explicit one-shot
+  diagnostic path can still map a leased identity snapshot to the serialized
+  `UpdateRemarkCommand`, perform the dry-run preview, and release that lease;
+  it never sends a successful completion result.
+- A claim or release request timeout is treated as a recoverable HTTP transport
+  failure, while cancellation requested by the Agent host remains normal
+  shutdown cancellation. Automatic production claiming must stay disabled
+  until a separately reviewed live UI adapter can produce a verified result;
+  `dry-run=false` remains rejected by this build.
+- During shutdown, the host first cancels and waits for both the heartbeat and
+  remark-task lease pumps, even if one pump has already failed, and only then
+  stops the serialized executor. This prevents a lease pump from claiming or
+  enqueueing work after executor shutdown has started.
+- The backend issues a high-entropy credential per registered Agent, stores only
+  its SHA-256 digest, and supports one-time issue, versioned rotation, and
+  immediate revocation. Logical backup schema v5 excludes all credential
+  material and restores registrations in a revoked state, so an administrator
+  must reissue a credential before the Agent can heartbeat again.
 
 No game package functionality is included.
 

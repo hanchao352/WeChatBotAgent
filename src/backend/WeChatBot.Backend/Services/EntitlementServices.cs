@@ -360,10 +360,13 @@ public sealed class ActivationService(
                 await transaction.CommitAsync(cancellationToken);
                 return result;
             }
-            catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6 && attempt < 7)
+            catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
             {
                 db.ChangeTracker.Clear();
-                await Task.Delay(TimeSpan.FromMilliseconds(15 * (attempt + 1)), cancellationToken);
+                if (attempt < 7)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(15 * (attempt + 1)), cancellationToken);
+                }
             }
         }
 
@@ -470,10 +473,13 @@ public sealed class ActivationService(
                 await transaction.CommitAsync(cancellationToken);
                 return result;
             }
-            catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6 && attempt < 7)
+            catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
             {
                 db.ChangeTracker.Clear();
-                await Task.Delay(TimeSpan.FromMilliseconds(15 * (attempt + 1)), cancellationToken);
+                if (attempt < 7)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(15 * (attempt + 1)), cancellationToken);
+                }
             }
             catch (DbUpdateException exception) when (
                 exception.InnerException is SqliteException { SqliteErrorCode: 19 } && attempt < 7)

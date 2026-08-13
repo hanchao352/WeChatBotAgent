@@ -46,10 +46,14 @@ public sealed class AppDbContext(
             entity.HasKey(x => x.Id);
             entity.HasIndex(x => new { x.TenantId, x.NormalizedAgentId }).IsUnique();
             entity.HasIndex(x => new { x.TenantId, x.WeChatInstanceId }).IsUnique();
+            // 独立凭据摘要必须在租户内唯一，防止两个注册共享同一认证能力；SQLite 允许多个 NULL 支持旧记录待签发。
+            entity.HasIndex(x => new { x.TenantId, x.CredentialHash }).IsUnique();
             entity.Property(x => x.AgentId).HasMaxLength(128).IsRequired();
             entity.Property(x => x.NormalizedAgentId).HasMaxLength(128).IsRequired();
             entity.Property(x => x.WeChatInstanceId).HasMaxLength(128).IsRequired();
             entity.Property(x => x.ConfigurationVersion).HasMaxLength(64).IsRequired();
+            // SHA-256 十六进制摘要固定为 64 字符；明文凭据不属于 EF 模型。
+            entity.Property(x => x.CredentialHash).HasMaxLength(AgentCredentialSecurity.HashLength);
             entity.Property(x => x.Version).IsConcurrencyToken();
             entity.HasQueryFilter(x => x.TenantId == tenantContext.TenantId);
         });
@@ -76,6 +80,8 @@ public sealed class AppDbContext(
         {
             entity.HasKey(x => x.Id);
             entity.HasIndex(x => new { x.TenantId, x.ExternalId }).IsUnique();
+            // 覆盖联系人游标分页的租户过滤、显示名称排序和唯一 ID 决胜键，避免大表全量排序。
+            entity.HasIndex(x => new { x.TenantId, x.DisplayName, x.Id });
             entity.Property(x => x.ExternalId).HasMaxLength(128).IsRequired();
             entity.Property(x => x.DisplayName).HasMaxLength(256).IsRequired();
             entity.Property(x => x.WeChatId).HasMaxLength(128);
@@ -90,6 +96,8 @@ public sealed class AppDbContext(
         {
             entity.HasKey(x => x.Id);
             entity.HasIndex(x => new { x.TenantId, x.ExternalId }).IsUnique();
+            // 覆盖群游标分页的租户过滤、显示名称排序和唯一 ID 决胜键，避免大表全量排序。
+            entity.HasIndex(x => new { x.TenantId, x.DisplayName, x.Id });
             entity.Property(x => x.ExternalId).HasMaxLength(128).IsRequired();
             entity.Property(x => x.DisplayName).HasMaxLength(256).IsRequired();
             entity.Property(x => x.BusinessName).HasMaxLength(256);
@@ -115,9 +123,19 @@ public sealed class AppDbContext(
         {
             entity.HasKey(x => x.Id);
             entity.HasIndex(x => new { x.TenantId, x.IdempotencyKey }).IsUnique();
+            // 领取扫描先按租户与业务状态收敛，再检查租约到期时间，并以创建时间和 ID 提供稳定顺序。
+            entity.HasIndex(x => new { x.TenantId, x.Status, x.LeaseExpiresAt, x.CreatedAt, x.Id });
+            // 完成结果 ID 仅需在同一租户内唯一；SQLite 的唯一索引允许多个 NULL，未完成任务不会互相冲突。
+            entity.HasIndex(x => new { x.TenantId, x.CompletionResultId }).IsUnique();
             entity.Property(x => x.IdempotencyKey).HasMaxLength(128).IsRequired();
             entity.Property(x => x.RequestHash).HasMaxLength(64).IsRequired();
             entity.Property(x => x.GeneratedRemark).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.TargetExternalId).HasMaxLength(128).IsRequired();
+            entity.Property(x => x.ExpectedTargetDisplayName).HasMaxLength(256).IsRequired();
+            entity.Property(x => x.ClaimedByAgentId).HasMaxLength(128);
+            entity.Property(x => x.ClaimedWeChatInstanceId).HasMaxLength(128);
+            entity.Property(x => x.LeaseTokenHash).HasMaxLength(64);
+            entity.Property(x => x.CompletionResultId).HasMaxLength(128);
             entity.Property(x => x.TargetKind).HasConversion<string>().HasMaxLength(32);
             entity.Property(x => x.Status).HasConversion<string>().HasMaxLength(32);
             entity.Property(x => x.Version).IsConcurrencyToken();

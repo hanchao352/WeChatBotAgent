@@ -6,7 +6,7 @@ Windows 微信 UI Automation 机器人首个可运行纵向切片。当前实现
 
 - 后端业务 API、SQLite 开发库、幂等与审计链路可运行。
 - 管理端可连接真实 API；后端不可用时进入离线只读，保留最后一次成功快照并禁用所有写操作。
-- Windows Agent 已具备环境诊断、安全门禁、串行命令、幂等日志和心跳客户端。
+- Windows Agent 已具备环境诊断、安全门禁、串行命令、幂等日志、独立凭据和心跳客户端。
 - 微信 `4.1.11.55` 的标准 UIA 树不暴露联系人和消息控件，因此当前 Agent 强制 `dry-run`，不会发送消息或修改备注。
 - 这是一套开发基线，不应被描述为已达到商业生产上线条件。正式上线仍需完成混合识别适配、生产认证/RBAC、队列与 PostgreSQL、监控告警、压力测试和灰度验证。
 
@@ -33,11 +33,7 @@ dotnet run --project E:\WeChatBot\src\backend\WeChatBot.Backend\WeChatBot.Backen
 wechatbot-local-development-key-change-me
 ```
 
-Agent 使用独立的开发凭据，不与管理员凭据混用：
-
-```text
-wechatbot-local-agent-development-key-change-me
-```
+Agent 凭据由管理员调用 `POST /api/agents` 首次签发；明文只在该响应出现一次，不与管理员凭据或其他 Agent 共用。完整流程见 [Agent 独立凭据](docs/AGENT_CREDENTIALS.md)。
 
 在第二个 PowerShell 窗口启动管理端：
 
@@ -58,7 +54,7 @@ dotnet run --project E:\WeChatBot\src\agent\WeChatBot.Agent -- --diagnose
 兼容性自检通过后，可用环境变量接入本地心跳接口：
 
 ```powershell
-$env:WECHATBOT_AGENT_CONTROL_PLANE_API_KEY = 'wechatbot-local-agent-development-key-change-me'
+$env:WECHATBOT_AGENT_CREDENTIAL = '<POST /api/agents 返回的一次性凭据>'
 dotnet run --project E:\WeChatBot\src\agent\WeChatBot.Agent -- --run --dry-run --heartbeat-uri=http://127.0.0.1:5188/api/agents/heartbeat --supported-version-prefixes='4.x.y-tested' --required-automation-id-fingerprints='structural:sha256=FULL_64_HEX_1,structural:sha256=FULL_64_HEX_2'
 ```
 

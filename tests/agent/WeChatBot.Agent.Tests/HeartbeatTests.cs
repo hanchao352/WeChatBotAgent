@@ -17,7 +17,7 @@ public sealed class HeartbeatTests
         var options = AgentOptions.Parse(
             [
                 "--heartbeat-uri=https://control.example/api/agents/heartbeat",
-                $"--control-plane-api-key={secret}"
+                $"--agent-credential={secret}"
             ],
             static _ => null);
         var handler = new RecordingHttpHandler(secret, HttpStatusCode.OK);
@@ -25,7 +25,7 @@ public sealed class HeartbeatTests
         var client = new HttpAgentHeartbeatClient(
             httpClient,
             options.HeartbeatUri!,
-            options.ControlPlaneApiKey!);
+            options.AgentCredential!);
 
         var response = await client.SendAsync(CreateHeartbeat(), CancellationToken.None);
 
@@ -42,7 +42,7 @@ public sealed class HeartbeatTests
         var options = AgentOptions.Parse(
             [
                 "--heartbeat-uri=https://control.example/api/agents/heartbeat",
-                $"--control-plane-api-key={secret}"
+                $"--agent-credential={secret}"
             ],
             static _ => null);
         using var httpClient = new HttpClient(
@@ -50,7 +50,7 @@ public sealed class HeartbeatTests
         var client = new HttpAgentHeartbeatClient(
             httpClient,
             options.HeartbeatUri!,
-            options.ControlPlaneApiKey!);
+            options.AgentCredential!);
 
         var exception = await Assert.ThrowsAsync<HttpRequestException>(
             () => client.SendAsync(CreateHeartbeat(), CancellationToken.None).AsTask());

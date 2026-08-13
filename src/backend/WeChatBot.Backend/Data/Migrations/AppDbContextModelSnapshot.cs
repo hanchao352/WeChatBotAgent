@@ -175,6 +175,19 @@ namespace WeChatBot.Backend.Data.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("CredentialHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("CredentialIssuedAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("CredentialRevokedAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("CredentialRotatedAt")
+                        .HasColumnType("INTEGER");
+
                     b.Property<bool>("IsEnabled")
                         .HasColumnType("INTEGER");
 
@@ -202,6 +215,9 @@ namespace WeChatBot.Backend.Data.Migrations
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "CredentialHash")
+                        .IsUnique();
 
                     b.HasIndex("TenantId", "NormalizedAgentId")
                         .IsUnique();
@@ -379,6 +395,8 @@ namespace WeChatBot.Backend.Data.Migrations
                     b.HasIndex("TenantId", "ExternalId")
                         .IsUnique();
 
+                    b.HasIndex("TenantId", "DisplayName", "Id");
+
                     b.ToTable("Contacts");
                 });
 
@@ -540,6 +558,8 @@ namespace WeChatBot.Backend.Data.Migrations
 
                     b.HasIndex("TenantId", "ExternalId")
                         .IsUnique();
+
+                    b.HasIndex("TenantId", "DisplayName", "Id");
 
                     b.ToTable("Groups");
                 });
@@ -708,14 +728,34 @@ namespace WeChatBot.Backend.Data.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT");
 
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ClaimedByAgentId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ClaimedWeChatInstanceId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
                     b.Property<long?>("CompletedAt")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("CompletionResultId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ConflictReason")
                         .HasColumnType("TEXT");
 
                     b.Property<long>("CreatedAt")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("ExpectedTargetDisplayName")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("FailureReason")
                         .HasColumnType("TEXT");
@@ -728,6 +768,13 @@ namespace WeChatBot.Backend.Data.Migrations
                     b.Property<string>("IdempotencyKey")
                         .IsRequired()
                         .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("LeaseExpiresAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("LeaseTokenHash")
+                        .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("OriginalSystemRemark")
@@ -749,6 +796,11 @@ namespace WeChatBot.Backend.Data.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("TargetExternalId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
                     b.Property<Guid>("TargetId")
                         .HasColumnType("TEXT");
 
@@ -768,8 +820,13 @@ namespace WeChatBot.Backend.Data.Migrations
 
                     b.HasIndex("RuleId");
 
+                    b.HasIndex("TenantId", "CompletionResultId")
+                        .IsUnique();
+
                     b.HasIndex("TenantId", "IdempotencyKey")
                         .IsUnique();
+
+                    b.HasIndex("TenantId", "Status", "LeaseExpiresAt", "CreatedAt", "Id");
 
                     b.ToTable("RemarkTasks");
                 });

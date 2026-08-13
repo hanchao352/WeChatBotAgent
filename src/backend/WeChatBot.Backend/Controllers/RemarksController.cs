@@ -90,9 +90,8 @@ public sealed class RemarkRulesController(
 [Route("api/remark-tasks")]
 public sealed class RemarkTasksController(
     AppDbContext db,
-    TenantContext tenant,
-    TimeProvider timeProvider,
     RemarkService remarkService,
+    RemarkTaskLeaseService leases,
     EntitlementService entitlements,
     AuditService audit) : ControllerBase
 {
@@ -152,76 +151,14 @@ public sealed class RemarkTasksController(
     {
         idempotencyKey = ValidateIdempotencyKey(idempotencyKey);
         var requestHash = StableHash.Sha256($"{request.RuleId:N}|{request.TargetId:N}");
-        var existing = await db.RemarkTasks.AsNoTracking()
-            .SingleOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey, cancellationToken);
-        if (existing is not null) return ValidateReplay(existing, requestHash);
-
-        var preview = await remarkService.PreviewAsync(request.RuleId, request.TargetId, cancellationToken);
-        var automationPaused = await db.Tenants.AsNoTracking()
-            .Select(x => x.AutomationPaused)
-            .SingleAsync(cancellationToken);
-        if (automationPaused)
-        {
-            audit.Add(
-                "remark-task.rejected.automation-paused",
-                nameof(RemarkTask),
-                request.TargetId.ToString("D"),
-                false,
-                new
-                {
-                    request.RuleId,
-                    request.TargetId,
-                    idempotencyKeyHash = StableHash.Sha256(idempotencyKey)
-                });
-            await db.SaveChangesAsync(cancellationToken);
-            throw DomainException.Conflict(
-                "automation_paused",
-                "Automation is paused; new remark tasks cannot be created.");
-        }
-        await EnsureAutoRemarkEntitledAsync(
-            preview.TargetKind,
-            request.TargetId,
-            request.TargetId,
-            "remark-task.rejected.feature-required",
+        var result = await leases.CreateAdministrativelyAsync(
+            request,
+            idempotencyKey,
+            requestHash,
             cancellationToken);
-        var now = timeProvider.GetUtcNow();
-        var task = new RemarkTask
-        {
-            Id = Guid.NewGuid(),
-            TenantId = tenant.TenantId,
-            RuleId = request.RuleId,
-            TargetKind = preview.TargetKind,
-            TargetId = request.TargetId,
-            IdempotencyKey = idempotencyKey,
-            RequestHash = requestHash,
-            GeneratedRemark = preview.GeneratedRemark,
-            OriginalSystemRemark = preview.CurrentSystemRemark,
-            OriginalWeChatRemark = preview.CurrentWeChatRemark,
-            Status = preview.HasConflict ? RemarkTaskStatus.Conflict : RemarkTaskStatus.Pending,
-            ConflictReason = preview.ConflictReason,
-            CreatedAt = now
-        };
-        db.RemarkTasks.Add(task);
-        audit.Add("remark-task.created", nameof(RemarkTask), task.Id.ToString("D"), details: new
-        {
-            task.RuleId,
-            task.TargetKind,
-            task.TargetId,
-            task.Status
-        });
-        try
-        {
-            await db.SaveChangesAsync(cancellationToken);
-        }
-        catch (DbUpdateException)
-        {
-            db.ChangeTracker.Clear();
-            existing = await db.RemarkTasks.AsNoTracking()
-                .SingleOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey, cancellationToken);
-            if (existing is null) throw;
-            return ValidateReplay(existing, requestHash);
-        }
-        return CreatedAtAction(nameof(Get), new { id = task.Id }, task);
+        return result.Replayed
+            ? Ok(result.Task)
+            : CreatedAtAction(nameof(Get), new { id = result.Task.Id }, result.Task);
     }
 
     [HttpGet("{id:guid}")]
@@ -229,135 +166,20 @@ public sealed class RemarkTasksController(
         await db.RemarkTasks.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, cancellationToken)
         ?? throw DomainException.NotFound("Remark task");
 
+    /// <summary>
+    /// 由管理员在没有活动 Agent 租约时提交备注任务终态，并在成功路径复用统一业务校验。
+    /// 已过期租约允许接管，但无论成功或失败都会清除旧租约凭据。
+    /// </summary>
+    /// <param name="id">待完成的备注任务标识。</param>
+    /// <param name="request">包含期望版本、执行结果以及互斥结果字段的管理员请求。</param>
+    /// <param name="cancellationToken">数据库查询和保存操作的取消令牌。</param>
+    /// <returns>写入终态、完成时刻和新版本后的备注任务。</returns>
     [HttpPost("{id:guid}/complete")]
-    public async Task<ActionResult<RemarkTask>> Complete(Guid id, RemarkTaskCompleteRequest request, CancellationToken cancellationToken)
-    {
-        var task = await db.RemarkTasks.SingleOrDefaultAsync(x => x.Id == id, cancellationToken)
-                   ?? throw DomainException.NotFound("Remark task");
-        if (task.Version != request.ExpectedVersion)
-            throw DomainException.Conflict("concurrency_conflict", "The remark task changed after it was read.");
-        if (task.Status != RemarkTaskStatus.Pending)
-            throw DomainException.Conflict("remark_task_not_pending", "Only pending remark tasks can be completed.");
-
-        var now = timeProvider.GetUtcNow();
-        if (request.Succeeded)
-        {
-            var automationPaused = await db.Tenants.AsNoTracking()
-                .Select(x => x.AutomationPaused)
-                .SingleAsync(cancellationToken);
-            if (automationPaused)
-            {
-                audit.Add(
-                    "remark-task.completion-rejected.automation-paused",
-                    nameof(RemarkTask),
-                    task.Id.ToString("D"),
-                    false,
-                    new { task.TargetKind, task.TargetId });
-                await db.SaveChangesAsync(cancellationToken);
-                throw DomainException.Conflict(
-                    "automation_paused",
-                    "Automation is paused; successful remark completion cannot be accepted.");
-            }
-            await EnsureAutoRemarkEntitledAsync(
-                task.TargetKind,
-                task.TargetId,
-                task.Id,
-                "remark-task.completion-rejected.feature-required",
-                cancellationToken);
-            if (!string.Equals(request.AppliedRemark, task.GeneratedRemark, StringComparison.Ordinal))
-                throw DomainException.Validation("applied_remark_mismatch", "AppliedRemark must exactly match the generated remark.");
-            await ApplySuccessfulRemarkAsync(task, now, cancellationToken);
-            task.Status = RemarkTaskStatus.Completed;
-        }
-        else
-        {
-            if (string.IsNullOrWhiteSpace(request.FailureReason))
-                throw DomainException.Validation("failure_reason_required", "FailureReason is required when the task failed.");
-            task.Status = RemarkTaskStatus.Failed;
-            task.FailureReason = request.FailureReason.Trim();
-        }
-        task.CompletedAt = now;
-        task.Version++;
-        audit.Add("remark-task.completed", nameof(RemarkTask), task.Id.ToString("D"), request.Succeeded, new
-        {
-            task.Status,
-            task.TargetKind,
-            task.TargetId,
-            task.FailureReason
-        });
-        await db.SaveChangesAsync(cancellationToken);
-        return task;
-    }
-
-    private async Task ApplySuccessfulRemarkAsync(RemarkTask task, DateTimeOffset now, CancellationToken cancellationToken)
-    {
-        if (task.TargetKind == ServiceTargetKind.Contact)
-        {
-            var contact = await db.Contacts.SingleOrDefaultAsync(x => x.Id == task.TargetId, cancellationToken)
-                          ?? throw DomainException.NotFound("Contact");
-            if (contact.ManualRemarkProtected)
-                throw DomainException.Conflict("remark_now_protected", "Manual remark protection was enabled after the task was created.");
-            await EnsureRemarkSnapshotUnchangedAsync(
-                task,
-                contact.SystemRemark,
-                contact.CurrentWeChatRemark,
-                cancellationToken);
-            contact.SystemRemark = task.GeneratedRemark;
-            contact.CurrentWeChatRemark = task.GeneratedRemark;
-            contact.UpdatedAt = now;
-            contact.Version++;
-        }
-        else if (task.TargetKind == ServiceTargetKind.Group)
-        {
-            var group = await db.Groups.SingleOrDefaultAsync(x => x.Id == task.TargetId, cancellationToken)
-                        ?? throw DomainException.NotFound("Group");
-            if (group.ManualRemarkProtected)
-                throw DomainException.Conflict("remark_now_protected", "Manual remark protection was enabled after the task was created.");
-            await EnsureRemarkSnapshotUnchangedAsync(
-                task,
-                group.SystemRemark,
-                group.CurrentWeChatRemark,
-                cancellationToken);
-            group.SystemRemark = task.GeneratedRemark;
-            group.CurrentWeChatRemark = task.GeneratedRemark;
-            group.UpdatedAt = now;
-            group.Version++;
-        }
-    }
-
-    private async Task EnsureRemarkSnapshotUnchangedAsync(
-        RemarkTask task,
-        string? currentSystemRemark,
-        string? currentWeChatRemark,
-        CancellationToken cancellationToken)
-    {
-        var systemRemarkChanged = !string.Equals(
-            task.OriginalSystemRemark,
-            currentSystemRemark,
-            StringComparison.Ordinal);
-        var weChatRemarkChanged = !string.Equals(
-            task.OriginalWeChatRemark,
-            currentWeChatRemark,
-            StringComparison.Ordinal);
-        if (!systemRemarkChanged && !weChatRemarkChanged) return;
-
-        audit.Add(
-            "remark-task.rejected.target-changed",
-            nameof(RemarkTask),
-            task.Id.ToString("D"),
-            false,
-            new
-            {
-                task.TargetKind,
-                task.TargetId,
-                systemRemarkChanged,
-                weChatRemarkChanged
-            });
-        await db.SaveChangesAsync(cancellationToken);
-        throw DomainException.Conflict(
-            "remark_target_changed",
-            "The target remarks changed after this task was created; create a new task from the current state.");
-    }
+    public async Task<ActionResult<RemarkTask>> Complete(
+        Guid id,
+        RemarkTaskCompleteRequest request,
+        CancellationToken cancellationToken) =>
+        await leases.CompleteAdministrativelyAsync(id, request, cancellationToken);
 
     private async Task EnsureAutoRemarkEntitledAsync(
         ServiceTargetKind targetKind,
@@ -398,10 +220,4 @@ public sealed class RemarkTasksController(
         return normalized;
     }
 
-    private static RemarkTask ValidateReplay(RemarkTask task, string requestHash)
-    {
-        if (!string.Equals(task.RequestHash, requestHash, StringComparison.Ordinal))
-            throw DomainException.Conflict("idempotency_key_reused", "The Idempotency-Key was already used for a different request.");
-        return task;
-    }
 }

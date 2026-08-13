@@ -449,8 +449,8 @@ public sealed class BackendHardeningIntegrationTests
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var first = await db.BackupManifests.IgnoreQueryFilters().SingleAsync(x => x.Id == firstBackup.Id);
             var second = await db.BackupManifests.IgnoreQueryFilters().SingleAsync(x => x.Id == secondBackup.Id);
-            Assert.Equal(3, first.SchemaVersion);
-            Assert.Equal(3, second.SchemaVersion);
+            Assert.Equal(5, first.SchemaVersion);
+            Assert.Equal(5, second.SchemaVersion);
 
             var firstFileName = first.FileName;
             var firstPayloadSha256 = first.PayloadSha256;
@@ -1275,6 +1275,7 @@ public sealed class BackendHardeningIntegrationTests
     [InlineData("ConnectionStrings:Database", "Data Source=relative.db", "absolute SQLite")]
     [InlineData("Backup:Directory", "relative-backups", "absolute path")]
     [InlineData("Auth:AllowAgentAutoRegistration", "true", "explicitly set to false")]
+    [InlineData("Auth:AllowLegacySharedAgentApiKey", "true", "use per-Agent credentials")]
     public async Task Production_rejects_unsafe_operational_defaults(
         string key,
         string value,
@@ -1298,6 +1299,7 @@ public sealed class BackendHardeningIntegrationTests
     [InlineData("Auth:AgentApiKey", "wechatbot-local-agent-development-key-change-me")]
     [InlineData("Activation:HashPepper", "local-activation-pepper-change-before-production-2026")]
     [InlineData("Audit:IntegrityKey", "local-audit-integrity-key-change-before-production-2026")]
+    [InlineData("Pagination:ProtectionKey", "local-cursor-protection-key-change-before-production-2026")]
     public async Task Production_rejects_public_development_secrets(string key, string value)
     {
         using var factory = new ProductionApplicationFactory(new Dictionary<string, string?>
@@ -1311,6 +1313,30 @@ public sealed class BackendHardeningIntegrationTests
             _ = await client.GetAsync("/health/live");
         });
         Assert.Contains("public development credential", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 验证租约时长配置缺失或越界时应用拒绝启动，避免永久独占或高频续租。
+    /// </summary>
+    /// <param name="value">无效的租约秒数配置。</param>
+    [Theory]
+    [InlineData("")]
+    [InlineData("14")]
+    [InlineData("301")]
+    [InlineData("not-a-number")]
+    public async Task Application_rejects_invalid_remark_task_lease_duration(string value)
+    {
+        using var factory = new ProductionApplicationFactory(new Dictionary<string, string?>
+        {
+            ["RemarkTaskLease:DurationSeconds"] = value
+        });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            using var client = factory.CreateClient();
+            _ = await client.GetAsync("/health/live");
+        });
+        Assert.Contains("DurationSeconds", exception.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1661,8 +1687,11 @@ public sealed class BackendHardeningIntegrationTests
                 ["Auth:ActorName"] = "production-admin",
                 ["Auth:AgentActorName"] = "production-agent",
                 ["Auth:AllowAgentAutoRegistration"] = "false",
+                ["Auth:AllowLegacySharedAgentApiKey"] = "false",
                 ["Activation:HashPepper"] = "production-activation-pepper-with-more-than-thirty-two-characters",
                 ["Audit:IntegrityKey"] = "production-audit-integrity-key-with-more-than-thirty-two-characters",
+                ["Pagination:ProtectionKey"] = "production-cursor-protection-key-with-more-than-thirty-two-characters",
+                ["RemarkTaskLease:DurationSeconds"] = "60",
                 ["Backup:Directory"] = Path.Combine(_root, "backups"),
                 ["Backup:EncryptionKeyBase64"] = Convert.ToBase64String(SHA256.HashData("production-backup-key"u8.ToArray()))
             };
@@ -1679,8 +1708,13 @@ public sealed class BackendHardeningIntegrationTests
             builder.UseSetting(
                 "Auth:AllowAgentAutoRegistration",
                 values["Auth:AllowAgentAutoRegistration"]);
+            builder.UseSetting(
+                "Auth:AllowLegacySharedAgentApiKey",
+                values["Auth:AllowLegacySharedAgentApiKey"]);
             builder.UseSetting("Activation:HashPepper", values["Activation:HashPepper"]);
             builder.UseSetting("Audit:IntegrityKey", values["Audit:IntegrityKey"]);
+            builder.UseSetting("Pagination:ProtectionKey", values["Pagination:ProtectionKey"]);
+            builder.UseSetting("RemarkTaskLease:DurationSeconds", values["RemarkTaskLease:DurationSeconds"]);
             builder.UseSetting("Backup:Directory", values["Backup:Directory"]);
             builder.UseSetting("Backup:EncryptionKeyBase64", values["Backup:EncryptionKeyBase64"]);
         }

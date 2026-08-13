@@ -3,12 +3,17 @@ using WeChatBot.Agent.Automation;
 using WeChatBot.Agent.Configuration;
 using WeChatBot.Agent.Execution;
 using WeChatBot.Agent.Heartbeat;
+using WeChatBot.Agent.Leases;
 using WeChatBot.Agent.Runtime;
 
 namespace WeChatBot.Agent;
 
+/// <summary>提供 Agent 命令行入口、启动自检和控制面后台任务生命周期管理。</summary>
 public static class Program
 {
+    /// <summary>解析配置并运行诊断、自检或正式 Agent 主循环。</summary>
+    /// <param name="args">命令行参数。</param>
+    /// <returns>适合进程管理器判断启动、配置或运行故障的退出码。</returns>
     public static async Task<int> Main(string[] args)
     {
         AgentOptions options;
@@ -121,17 +126,18 @@ public static class Program
         };
 
         Task? heartbeatTask = null;
+        Task? remarkTaskLeaseTask = null;
         HttpClient? httpClient = null;
         if (options.HeartbeatUri is not null)
         {
-            var apiKey = options.ControlPlaneApiKey
+            var agentCredential = options.AgentCredential
                 ?? throw new InvalidOperationException("Validated heartbeat credentials are unavailable.");
             httpClient = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false })
             {
                 Timeout = TimeSpan.FromSeconds(10)
             };
             var pump = new AgentHeartbeatPump(
-                new HttpAgentHeartbeatClient(httpClient, options.HeartbeatUri, apiKey),
+                new HttpAgentHeartbeatClient(httpClient, options.HeartbeatUri, agentCredential),
                 runtime,
                 () => (executor.QueueDepth, executor.ActiveExecutions),
                 options.AgentId,
@@ -142,6 +148,22 @@ public static class Program
                 recoverySelfCheck: recoverySelfCheck,
                 recoverySelfCheckTimeout: options.UiProbeTimeout);
             heartbeatTask = pump.RunAsync(shutdown.Token);
+
+            if (options.RemarkTaskLeaseUri is not null)
+            {
+                var leasePump = new RemarkTaskLeasePump(
+                    new HttpRemarkTaskLeaseClient(
+                        httpClient,
+                        options.RemarkTaskLeaseUri,
+                        options.AgentId,
+                        options.WeChatInstanceId,
+                        agentCredential),
+                    executor,
+                    runtime,
+                    options.WeChatInstanceId,
+                    TimeSpan.FromSeconds(5));
+                remarkTaskLeaseTask = leasePump.RunAsync(shutdown.Token);
+            }
         }
 
         var exitCode = 0;
@@ -154,8 +176,11 @@ public static class Program
             }
             else
             {
-                var completed = await Task.WhenAny(shutdownWait, heartbeatTask).ConfigureAwait(false);
-                if (completed == heartbeatTask && !shutdown.IsCancellationRequested)
+                var supervisedTasks = remarkTaskLeaseTask is null
+                    ? new[] { shutdownWait, heartbeatTask }
+                    : new[] { shutdownWait, heartbeatTask, remarkTaskLeaseTask };
+                var completed = await Task.WhenAny(supervisedTasks).ConfigureAwait(false);
+                if (completed != shutdownWait && !shutdown.IsCancellationRequested)
                 {
                     runtime.PauseForControlPlane(
                         "The heartbeat pump stopped unexpectedly.",
@@ -176,13 +201,11 @@ public static class Program
         }
         finally
         {
-            await executor.StopAsync().ConfigureAwait(false);
+            // 先通知所有后台泵停止，避免租约泵在执行器关闭后继续领取或入队。
+            shutdown.Cancel();
             try
             {
-                if (heartbeatTask is not null)
-                {
-                    await heartbeatTask.ConfigureAwait(false);
-                }
+                await AwaitControlPlaneShutdownAsync(heartbeatTask, remarkTaskLeaseTask).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
             {
@@ -190,14 +213,30 @@ public static class Program
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine($"Heartbeat pump failed ({exception.GetType().Name}).");
+                Console.Error.WriteLine($"Control-plane supervision failed ({exception.GetType().Name}).");
                 exitCode = 4;
             }
 
+            await executor.StopAsync().ConfigureAwait(false);
             httpClient?.Dispose();
         }
 
         return exitCode;
+    }
+
+    /// <summary>
+    /// 等待所有已启动的控制面后台泵结束，确保任一泵失败时也不会跳过其余泵的关闭等待。
+    /// </summary>
+    /// <param name="heartbeatTask">心跳泵任务；未配置控制面时为空。</param>
+    /// <param name="remarkTaskLeaseTask">备注任务租约泵任务；未配置租约轮询时为空。</param>
+    internal static Task AwaitControlPlaneShutdownAsync(
+        Task? heartbeatTask,
+        Task? remarkTaskLeaseTask)
+    {
+        // Task.WhenAll 会在返回前观察并等待所有任务，即使其中一个任务已率先失败。
+        var controlPlaneTasks = new[] { heartbeatTask, remarkTaskLeaseTask }
+            .OfType<Task>();
+        return Task.WhenAll(controlPlaneTasks);
     }
 
     private static void PrintHelp()
@@ -214,7 +253,10 @@ public static class Program
               --required-automation-id-fingerprints=f1,f2
                                                    Required hashes from an approved redacted UI signature.
               --heartbeat-uri=https://host/path    Optional control-plane heartbeat endpoint.
-              --control-plane-api-key=value        Required with heartbeat URI; prefer the environment variable.
+              --remark-task-lease-uri=https://host/api/agents
+                                                   Optional dry-run remark-task lease base endpoint.
+              --agent-credential=value             Per-Agent credential; prefer WECHATBOT_AGENT_CREDENTIAL.
+              --control-plane-api-key=value        Deprecated alias for credential migration only.
               --agent-id=value                     Stable agent identity.
               --instance-id=value                  Bound WeChat instance identity.
               --state-directory=path               Durable idempotency journal directory.

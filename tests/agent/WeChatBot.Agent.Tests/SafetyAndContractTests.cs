@@ -15,7 +15,7 @@ public sealed class SafetyAndContractTests
 
         Assert.True(options.DryRun);
         Assert.Equal(AgentRunMode.SelfCheck, options.Mode);
-        Assert.Null(options.ControlPlaneApiKey);
+        Assert.Null(options.AgentCredential);
     }
 
     [Fact]
@@ -34,7 +34,7 @@ public sealed class SafetyAndContractTests
             ["--heartbeat-uri=https://control.example/api/agents/heartbeat"],
             static _ => null));
 
-        Assert.Contains("control-plane API key", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Agent credential", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -44,13 +44,13 @@ public sealed class SafetyAndContractTests
         var options = AgentOptions.Parse(
             [
                 "--heartbeat-uri=https://control.example/api/agents/heartbeat",
-                $"--control-plane-api-key={secret}"
+                $"--agent-credential={secret}"
             ],
             static _ => null);
 
-        Assert.NotNull(options.ControlPlaneApiKey);
-        Assert.True(options.ControlPlaneApiKey.Matches(secret));
-        Assert.Equal("[redacted]", options.ControlPlaneApiKey.ToString());
+        Assert.NotNull(options.AgentCredential);
+        Assert.True(options.AgentCredential.Matches(secret));
+        Assert.Equal("[redacted]", options.AgentCredential.ToString());
         Assert.DoesNotContain(secret, options.ToString(), StringComparison.Ordinal);
     }
 
@@ -60,10 +60,35 @@ public sealed class SafetyAndContractTests
         const string secret = "environment-test-secret";
         var options = AgentOptions.Parse(
             ["--heartbeat-uri=https://control.example/api/agents/heartbeat"],
-            variable => variable == "WECHATBOT_AGENT_CONTROL_PLANE_API_KEY" ? secret : null);
+            variable => variable == "WECHATBOT_AGENT_CREDENTIAL" ? secret : null);
 
-        Assert.NotNull(options.ControlPlaneApiKey);
-        Assert.True(options.ControlPlaneApiKey.Matches(secret));
+        Assert.NotNull(options.AgentCredential);
+        Assert.True(options.AgentCredential.Matches(secret));
+    }
+
+    /// <summary>验证迁移期旧参数仍可读取，但新独立凭据参数具有明确优先级。</summary>
+    [Fact]
+    public void AgentCredentialPrefersNewNameAndSupportsDeprecatedAlias()
+    {
+        var legacy = AgentOptions.Parse(
+            [
+                "--run",
+                "--heartbeat-uri=https://control.example/api/agents/heartbeat",
+                "--control-plane-api-key=legacy-secret"
+            ],
+            _ => null);
+        Assert.True(legacy.AgentCredential!.Matches("legacy-secret"));
+
+        var preferred = AgentOptions.Parse(
+            [
+                "--run",
+                "--heartbeat-uri=https://control.example/api/agents/heartbeat",
+                "--agent-credential=independent-secret",
+                "--control-plane-api-key=legacy-secret"
+            ],
+            _ => null);
+        Assert.True(preferred.AgentCredential!.Matches("independent-secret"));
+        Assert.False(preferred.AgentCredential.Matches("legacy-secret"));
     }
 
     [Fact]

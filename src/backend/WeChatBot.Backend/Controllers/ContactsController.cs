@@ -15,15 +15,84 @@ namespace WeChatBot.Backend.Controllers;
 public sealed class ContactsController(
     AppDbContext db,
     TenantContext tenant,
+    CursorProtector cursors,
     TimeProvider timeProvider,
     AuditService audit) : ControllerBase
 {
+    /// <summary>联系人列表游标的稳定范围标识；修改排序语义时必须同步升级该值。</summary>
+    private const string CursorScope = "contacts:display-name-id:v1";
+
+    /// <summary>
+    /// 按显示名称和唯一 ID 升序列出联系人。仅使用旧版 <paramref name="take"/> 时返回数组；
+    /// 使用 <paramref name="pageSize"/> 或 <paramref name="cursor"/> 时返回游标分页对象。
+    /// </summary>
+    /// <param name="take">旧版数组响应的最大数量，保留用于现有调用方兼容。</param>
+    /// <param name="pageSize">游标模式页容量，范围为 1 到 500。</param>
+    /// <param name="cursor">上一页返回的不透明下一页游标。</param>
+    /// <param name="cancellationToken">请求取消令牌。</param>
+    /// <returns>旧版联系人数组或新版 <see cref="CursorPage{T}"/>。</returns>
     [HttpGet]
-    public async Task<ActionResult<IReadOnlyList<Contact>>> List([FromQuery] int take = 100, CancellationToken cancellationToken = default)
+    [ProducesResponseType<IReadOnlyList<Contact>>(StatusCodes.Status200OK)]
+    [ProducesResponseType<CursorPage<Contact>>(StatusCodes.Status200OK)]
+    public async Task<IActionResult> List(
+        [FromQuery] int take = CursorPaginationLimits.DefaultPageSize,
+        [FromQuery] int? pageSize = null,
+        [FromQuery] string? cursor = null,
+        CancellationToken cancellationToken = default)
     {
-        if (take is < 1 or > 500) throw DomainException.Validation("invalid_page_size", "take must be between 1 and 500.");
-        return await db.Contacts.AsNoTracking().OrderBy(x => x.DisplayName).Take(take).ToListAsync(cancellationToken);
+        // 以查询键是否出现区分协议模式，使显式空游标也能进入严格校验而不会静默回退。
+        var cursorModeRequested = Request.Query.ContainsKey(nameof(pageSize)) ||
+                                  Request.Query.ContainsKey(nameof(cursor));
+
+        // 没有游标参数时保持原数组契约，避免现有管理端和集成方被响应包装破坏。
+        if (!cursorModeRequested)
+        {
+            var legacyTake = CursorPaginationLimits.ValidateLegacyTake(take);
+            var legacyItems = await OrderedContacts().Take(legacyTake).ToListAsync(cancellationToken);
+            return Ok(legacyItems);
+        }
+
+        // 新模式禁止同时改变旧 take，避免两个容量参数含义冲突并产生不可预测结果。
+        if (Request.Query.ContainsKey(nameof(take)))
+        {
+            throw DomainException.Validation(
+                "conflicting_page_size",
+                "take cannot be combined with pageSize or cursor.");
+        }
+
+        var resolvedPageSize = CursorPaginationLimits.Resolve(pageSize);
+        IQueryable<Contact> query = OrderedContacts();
+        if (Request.Query.ContainsKey(nameof(cursor)))
+        {
+            var position = cursors.Unprotect(cursor ?? string.Empty, CursorScope, tenant.TenantId);
+
+            // 键集条件严格位于末项之后；唯一 ID 决胜键保证重名联系人不会重复或遗漏。
+            query = query.Where(x =>
+                string.Compare(x.DisplayName, position.SortKey) > 0 ||
+                (x.DisplayName == position.SortKey && x.Id.CompareTo(position.Id) > 0));
+        }
+
+        // 多读取一条仅用于判断是否还有下一页，响应中不会暴露该探测记录。
+        var candidates = await query.Take(resolvedPageSize + 1).ToListAsync(cancellationToken);
+        var hasMore = candidates.Count > resolvedPageSize;
+        if (hasMore) candidates.RemoveAt(resolvedPageSize);
+        var nextCursor = hasMore
+            ? cursors.Protect(
+                CursorScope,
+                tenant.TenantId,
+                new CursorPosition(candidates[^1].DisplayName, candidates[^1].Id))
+            : null;
+        return Ok(new CursorPage<Contact>(candidates, nextCursor, hasMore));
     }
+
+    /// <summary>
+    /// 创建联系人稳定排序查询。唯一 ID 是显示名称相同时的决胜键，并与游标载荷保持一致。
+    /// </summary>
+    /// <returns>尚未执行、已启用租户过滤且无跟踪的有序查询。</returns>
+    private IOrderedQueryable<Contact> OrderedContacts() =>
+        db.Contacts.AsNoTracking()
+            .OrderBy(x => x.DisplayName)
+            .ThenBy(x => x.Id);
 
     [HttpGet("{id:guid}")]
     public async Task<ActionResult<Contact>> Get(Guid id, CancellationToken cancellationToken)

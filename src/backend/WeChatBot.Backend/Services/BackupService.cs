@@ -21,6 +21,42 @@ public sealed record BackupVerification(Guid BackupId, bool IsValid, string Expe
 
 internal sealed record BackupCreateCheckpoint(Guid BackupId);
 
+/// <summary>
+/// 表示逻辑备份允许保存的 Agent 注册元数据；有意不定义凭据摘要和凭据生命周期字段。
+/// </summary>
+internal sealed class AgentRegistrationBackup
+{
+    /// <summary>获取或设置 AgentRegistration 主键。</summary>
+    public Guid Id { get; set; }
+
+    /// <summary>获取或设置注册所属租户。</summary>
+    public Guid TenantId { get; set; }
+
+    /// <summary>获取或设置展示用 AgentId。</summary>
+    public string AgentId { get; set; } = string.Empty;
+
+    /// <summary>获取或设置规范化 AgentId。</summary>
+    public string NormalizedAgentId { get; set; } = string.Empty;
+
+    /// <summary>获取或设置固定微信实例绑定。</summary>
+    public string WeChatInstanceId { get; set; } = string.Empty;
+
+    /// <summary>获取或设置注册是否启用。</summary>
+    public bool IsEnabled { get; set; }
+
+    /// <summary>获取或设置配置版本。</summary>
+    public string ConfigurationVersion { get; set; } = "1";
+
+    /// <summary>获取或设置首次注册时间。</summary>
+    public DateTimeOffset RegisteredAt { get; set; }
+
+    /// <summary>获取或设置备份时的注册更新时间。</summary>
+    public DateTimeOffset UpdatedAt { get; set; }
+
+    /// <summary>获取或设置备份时的并发版本。</summary>
+    public long Version { get; set; } = 1;
+}
+
 public sealed record RestoreResult(
     Guid RestoreId,
     Guid BackupId,
@@ -33,15 +69,28 @@ public sealed record RestoreResult(
 
 internal sealed class LogicalBackupPayload
 {
-    public const int CurrentSchemaVersion = 3;
+    /// <summary>首次包含备注任务目标身份快照并要求剥离活动租约的模式版本。</summary>
+    public const int RemarkTaskLeaseSchemaVersion = 4;
+
+    /// <summary>首次使用无凭据 Agent 注册 DTO 的模式版本。</summary>
+    public const int CredentiallessAgentSchemaVersion = 5;
+
+    /// <summary>
+    /// 当前逻辑备份模式版本；版本 5 在版本 4 租约规则基础上使用无凭据 Agent DTO，禁止摘要进入载荷。
+    /// </summary>
+    public const int CurrentSchemaVersion = CredentiallessAgentSchemaVersion;
+
+    /// <summary>仍可验证和恢复的最早逻辑备份版本。</summary>
     public const int MinimumSupportedSchemaVersion = 1;
+
+    /// <summary>获取或设置备份模式版本。</summary>
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public Guid BackupId { get; set; }
     public Guid TenantId { get; set; }
     public DateTimeOffset ExportedAt { get; set; }
     public TenantState? Tenant { get; set; }
     public List<ServicePackage> ServicePackages { get; set; } = [];
-    public List<AgentRegistration> AgentRegistrations { get; set; } = [];
+    public List<AgentRegistrationBackup> AgentRegistrations { get; set; } = [];
     public List<Contact> Contacts { get; set; } = [];
     public List<GroupChat> Groups { get; set; } = [];
     public List<RemarkRule> RemarkRules { get; set; } = [];
@@ -151,11 +200,21 @@ public sealed class LogicalBackupService(
                 ExportedAt = now,
                 Tenant = await db.Tenants.AsNoTracking().SingleOrDefaultAsync(cancellationToken),
                 ServicePackages = await db.ServicePackages.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
-                AgentRegistrations = await db.AgentRegistrations.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                // 逻辑备份只保存注册元数据，凭据摘要和生命周期从不进入序列化对象图。
+                AgentRegistrations = (await db.AgentRegistrations.AsNoTracking()
+                        .OrderBy(x => x.Id)
+                        .ToListAsync(cancellationToken))
+                    .Select(ToAgentRegistrationBackup)
+                    .ToList(),
                 Contacts = await db.Contacts.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
                 Groups = await db.Groups.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
                 RemarkRules = await db.RemarkRules.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
-                RemarkTasks = await db.RemarkTasks.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
+                // 活动租约是短期授权而非业务事实；备份中只保留任务和尝试历史，避免恢复后旧令牌继续生效。
+                RemarkTasks = (await db.RemarkTasks.AsNoTracking()
+                        .OrderBy(x => x.Id)
+                        .ToListAsync(cancellationToken))
+                    .Select(ClearActiveRemarkTaskLease)
+                    .ToList(),
                 GroupMentions = await db.GroupMentions.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
                 Entitlements = await db.Entitlements.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
                 EntitlementLedger = await db.EntitlementLedger.AsNoTracking().OrderBy(x => x.Id).ToListAsync(cancellationToken),
@@ -466,11 +525,23 @@ public sealed class LogicalBackupService(
         tenantState.Version++;
 
         restored["servicePackages"] = await RestoreServicePackagesAsync(payload.ServicePackages, cancellationToken);
+        // 现存注册不被旧备份覆盖，但其当前凭据同样属于恢复前授权，必须全部失效并重新签发。
+        await RevokeExistingAgentCredentialsForRestoreAsync(startedAt, cancellationToken);
         restored["agentRegistrations"] = await RestoreAgentRegistrationsAsync(payload.AgentRegistrations, cancellationToken);
         restored["contacts"] = await RestoreContactsAsync(payload.Contacts, cancellationToken);
         restored["groups"] = await RestoreGroupsAsync(payload.Groups, cancellationToken);
         restored["remarkRules"] = await RestoreRemarkRulesAsync(payload.RemarkRules, cancellationToken);
-        restored["remarkTasks"] = await AddMissingAsync(db.RemarkTasks, payload.RemarkTasks, x => x.Id, cancellationToken);
+        // schema v1-v3 尚未保存任务身份快照；目标合并完成后再从备份目标或当前数据库补齐空字段。
+        await PopulateLegacyRemarkTaskIdentitySnapshotsAsync(payload, cancellationToken);
+        // 兼容旧备份时也强制剥离租约字段；任何恢复出的待处理任务都必须重新认领。
+        var restorableRemarkTasks = payload.RemarkTasks
+            .Select(ClearActiveRemarkTaskLease)
+            .ToList();
+        restored["remarkTasks"] = await AddMissingAsync(
+            db.RemarkTasks,
+            restorableRemarkTasks,
+            x => x.Id,
+            cancellationToken);
         restored["entitlements"] = await AddMissingAsync(db.Entitlements, payload.Entitlements, x => x.Id, cancellationToken);
         restored["activationCodes"] = await AddMissingAsync(db.ActivationCodes, payload.ActivationCodes, x => x.Id, cancellationToken);
         restored["entitlementLedger"] = await AddMissingAsync(db.EntitlementLedger, payload.EntitlementLedger, x => x.Id, cancellationToken);
@@ -546,7 +617,7 @@ public sealed class LogicalBackupService(
     }
 
     private async Task<int> RestoreAgentRegistrationsAsync(
-        List<AgentRegistration> source,
+        List<AgentRegistrationBackup> source,
         CancellationToken cancellationToken)
     {
         var existing = await db.AgentRegistrations.AsNoTracking().ToListAsync(cancellationToken);
@@ -567,21 +638,79 @@ public sealed class LogicalBackupService(
                 continue;
             }
 
-            item.AgentId = item.AgentId.Trim();
-            item.NormalizedAgentId = normalizedAgentId;
-            item.WeChatInstanceId = item.WeChatInstanceId.Trim();
-            item.ConfigurationVersion = string.IsNullOrWhiteSpace(item.ConfigurationVersion)
+            var agentId = item.AgentId.Trim();
+            var instanceId = item.WeChatInstanceId.Trim();
+            var configurationVersion = string.IsNullOrWhiteSpace(item.ConfigurationVersion)
                 ? "1"
                 : item.ConfigurationVersion.Trim();
-            db.AgentRegistrations.Add(item);
+            // 无论载荷 schema 新旧，恢复出的注册都不继承灾备前认证能力，管理员必须重新轮换签发。
+            db.AgentRegistrations.Add(new AgentRegistration
+            {
+                Id = item.Id,
+                TenantId = item.TenantId,
+                AgentId = agentId,
+                NormalizedAgentId = normalizedAgentId,
+                WeChatInstanceId = instanceId,
+                IsEnabled = item.IsEnabled,
+                ConfigurationVersion = configurationVersion,
+                CredentialHash = null,
+                CredentialIssuedAt = null,
+                CredentialRotatedAt = null,
+                CredentialRevokedAt = timeProvider.GetUtcNow(),
+                RegisteredAt = item.RegisteredAt,
+                UpdatedAt = timeProvider.GetUtcNow(),
+                Version = Math.Max(1, item.Version + 1)
+            });
             existingIds.Add(item.Id);
             existingAgentIds.Add(normalizedAgentId);
-            existingInstanceIds.Add(item.WeChatInstanceId);
+            existingInstanceIds.Add(instanceId);
             restored++;
         }
 
         return restored;
     }
+
+    /// <summary>
+    /// 在恢复事务内清除当前租户所有现存 Agent 凭据，确保恢复完成后灾备前任何明文都不能继续认证。
+    /// </summary>
+    /// <param name="revokedAt">本次恢复开始的统一吊销时间。</param>
+    /// <param name="cancellationToken">数据库查询取消令牌。</param>
+    private async Task RevokeExistingAgentCredentialsForRestoreAsync(
+        DateTimeOffset revokedAt,
+        CancellationToken cancellationToken)
+    {
+        var registrations = await db.AgentRegistrations
+            .Where(x => x.CredentialHash != null || x.CredentialRevokedAt == null)
+            .ToListAsync(cancellationToken);
+        foreach (var registration in registrations)
+        {
+            // 摘要本身也是认证材料，恢复时必须物理清除；保留吊销时间供管理员判断需重新签发。
+            registration.CredentialHash = null;
+            registration.CredentialRevokedAt = revokedAt;
+            registration.UpdatedAt = revokedAt;
+            registration.Version++;
+        }
+
+        // 心跳状态作为运维遥测保留。凭据被清除后列表与租约门禁立即离线；后续轮换时间会建立
+        // 新的会话边界，因此重新签发后的 Agent 仍必须发送新心跳才能领取租约。
+    }
+
+    /// <summary>将数据库注册投影为明确不含凭据字段的备份 DTO。</summary>
+    /// <param name="source">当前数据库中的 AgentRegistration。</param>
+    /// <returns>只包含可恢复注册元数据的独立对象。</returns>
+    private static AgentRegistrationBackup ToAgentRegistrationBackup(AgentRegistration source) => new()
+    {
+        Id = source.Id,
+        TenantId = source.TenantId,
+        AgentId = source.AgentId,
+        NormalizedAgentId = source.NormalizedAgentId,
+        WeChatInstanceId = source.WeChatInstanceId,
+        IsEnabled = source.IsEnabled,
+        ConfigurationVersion = source.ConfigurationVersion,
+        RegisteredAt = source.RegisteredAt,
+        UpdatedAt = source.UpdatedAt,
+        Version = source.Version
+    };
 
     private async Task<int> RestoreServicePackagesAsync(
         IReadOnlyCollection<ServicePackage> source,
@@ -676,6 +805,132 @@ public sealed class LogicalBackupService(
         return missing.Count;
     }
 
+    /// <summary>
+    /// 为 schema v1-v3 备份中缺失的备注任务身份快照补值；schema v4 必须继续通过其原有严格载荷校验。
+    /// </summary>
+    /// <param name="payload">已经通过租户、计数和引用完整性预校验的逻辑备份载荷。</param>
+    /// <param name="cancellationToken">用于取消数据库目标查询的令牌。</param>
+    private async Task PopulateLegacyRemarkTaskIdentitySnapshotsAsync(
+        LogicalBackupPayload payload,
+        CancellationToken cancellationToken)
+    {
+        // v4 起在进入恢复事务前已要求两项快照均非空，禁止用恢复时目标值掩盖损坏或篡改载荷。
+        if (payload.SchemaVersion >= LogicalBackupPayload.RemarkTaskLeaseSchemaVersion) return;
+
+        // 只处理至少缺失一项身份字段的旧任务，已有非空字段必须保持备份中的原始值。
+        var incompleteTasks = payload.RemarkTasks
+            .Where(task =>
+                string.IsNullOrWhiteSpace(task.TargetExternalId) ||
+                string.IsNullOrWhiteSpace(task.ExpectedTargetDisplayName))
+            .ToArray();
+        if (incompleteTasks.Length == 0) return;
+
+        // 备份集合优先：同一恢复事务刚按这些值合并目标，任务快照应与灾备时目标身份保持一致。
+        var backupContacts = payload.Contacts.ToDictionary(contact => contact.Id);
+        var backupGroups = payload.Groups.ToDictionary(group => group.Id);
+        // 当前数据库只为备份未携带的目标提供回退，查询范围显式限定当前租户和实际缺失的目标 ID。
+        var fallbackContactIds = incompleteTasks
+            .Where(task =>
+                task.TargetKind == ServiceTargetKind.Contact &&
+                !backupContacts.ContainsKey(task.TargetId))
+            .Select(task => task.TargetId)
+            .Distinct()
+            .ToArray();
+        var fallbackGroupIds = incompleteTasks
+            .Where(task =>
+                task.TargetKind == ServiceTargetKind.Group &&
+                !backupGroups.ContainsKey(task.TargetId))
+            .Select(task => task.TargetId)
+            .Distinct()
+            .ToArray();
+        var currentContacts = await db.Contacts
+            .Where(contact => fallbackContactIds.Contains(contact.Id))
+            .ToDictionaryAsync(contact => contact.Id, cancellationToken);
+        var currentGroups = await db.Groups
+            .Where(group => fallbackGroupIds.Contains(group.Id))
+            .ToDictionaryAsync(group => group.Id, cancellationToken);
+
+        foreach (var task in incompleteTasks)
+        {
+            // 目标解析同时匹配任务声明的类型和主键；备份载荷及 DbContext 查询过滤器已经限定当前租户。
+            var identity = task.TargetKind switch
+            {
+                ServiceTargetKind.Contact when backupContacts.TryGetValue(task.TargetId, out var backupContact) =>
+                    new RemarkTargetIdentity(backupContact.ExternalId, backupContact.DisplayName),
+                ServiceTargetKind.Contact when currentContacts.TryGetValue(task.TargetId, out var currentContact) =>
+                    new RemarkTargetIdentity(currentContact.ExternalId, currentContact.DisplayName),
+                ServiceTargetKind.Group when backupGroups.TryGetValue(task.TargetId, out var backupGroup) =>
+                    new RemarkTargetIdentity(backupGroup.ExternalId, backupGroup.DisplayName),
+                ServiceTargetKind.Group when currentGroups.TryGetValue(task.TargetId, out var currentGroup) =>
+                    new RemarkTargetIdentity(currentGroup.ExternalId, currentGroup.DisplayName),
+                _ => null
+            };
+            if (identity is null)
+            {
+                // 不制造永久不可领取的任务；该异常会回滚恢复事务，现有引用错误码保持 API 兼容。
+                throw DomainException.Conflict(
+                    "backup_reference_integrity_failed",
+                    "A legacy remark task target is unavailable in both the backup and the current tenant database.");
+            }
+            if (string.IsNullOrWhiteSpace(identity.ExternalId) ||
+                string.IsNullOrWhiteSpace(identity.DisplayName))
+            {
+                // 已找到但没有完整稳定身份的目标同样不能用于生成可执行任务快照。
+                throw DomainException.Conflict(
+                    "backup_remark_task_identity_invalid",
+                    "A legacy remark task target does not provide a complete stable identity snapshot.");
+            }
+
+            // 分字段补齐：若旧载荷已携带其中一项非空快照，必须保留该历史事实而不是整体覆盖。
+            if (string.IsNullOrWhiteSpace(task.TargetExternalId))
+            {
+                task.TargetExternalId = identity.ExternalId;
+            }
+            if (string.IsNullOrWhiteSpace(task.ExpectedTargetDisplayName))
+            {
+                task.ExpectedTargetDisplayName = identity.DisplayName;
+            }
+        }
+    }
+
+    /// <summary>表示从联系人或群解析出的稳定外部标识和显示名称。</summary>
+    /// <param name="ExternalId">目标在微信侧或上游数据源中的稳定外部标识。</param>
+    /// <param name="DisplayName">恢复时用于执行前身份核验的目标显示名称。</param>
+    private sealed record RemarkTargetIdentity(string ExternalId, string DisplayName);
+
+    /// <summary>
+    /// 清除备注任务上的短期租约授权，同时保留任务状态、尝试次数和已完成结果标识。
+    /// </summary>
+    /// <param name="source">来自数据库或备份载荷的任务。</param>
+    /// <returns>不含活动租约持有证明的独立任务副本。</returns>
+    private static RemarkTask ClearActiveRemarkTaskLease(RemarkTask source) => new()
+    {
+        Id = source.Id,
+        TenantId = source.TenantId,
+        RuleId = source.RuleId,
+        TargetKind = source.TargetKind,
+        TargetId = source.TargetId,
+        TargetExternalId = source.TargetExternalId,
+        ExpectedTargetDisplayName = source.ExpectedTargetDisplayName,
+        IdempotencyKey = source.IdempotencyKey,
+        RequestHash = source.RequestHash,
+        GeneratedRemark = source.GeneratedRemark,
+        OriginalSystemRemark = source.OriginalSystemRemark,
+        OriginalWeChatRemark = source.OriginalWeChatRemark,
+        Status = source.Status,
+        ConflictReason = source.ConflictReason,
+        FailureReason = source.FailureReason,
+        ClaimedByAgentId = null,
+        ClaimedWeChatInstanceId = null,
+        LeaseTokenHash = null,
+        LeaseExpiresAt = null,
+        AttemptCount = source.AttemptCount,
+        CompletionResultId = source.CompletionResultId,
+        CreatedAt = source.CreatedAt,
+        CompletedAt = source.CompletedAt,
+        Version = source.Version
+    };
+
     private void EnsureAuditLogsHaveValidIntegrity(IEnumerable<AuditLog> source)
     {
         if (source.Any(x => x.TenantId != tenant.TenantId || !audit.HasValidIntegrity(x)))
@@ -710,6 +965,15 @@ public sealed class LogicalBackupService(
         }
 
         EnsurePayloadTenantIsolation(payload);
+        if (payload.SchemaVersion >= LogicalBackupPayload.RemarkTaskLeaseSchemaVersion &&
+            payload.RemarkTasks.Any(x =>
+                string.IsNullOrWhiteSpace(x.TargetExternalId) ||
+                string.IsNullOrWhiteSpace(x.ExpectedTargetDisplayName)))
+        {
+            throw DomainException.Conflict(
+                "backup_remark_task_identity_invalid",
+                "Version 4 or newer remark tasks must include stable target identity snapshots; restore was not started.");
+        }
         await EnsurePayloadReferentialIntegrityAsync(payload, cancellationToken);
         await EnsurePayloadPackageReferencesAsync(payload, cancellationToken);
         EnsureAuditLogsHaveValidIntegrity(payload.AuditLogs);
